@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=keepterm
+GenericName=Terminal
+Comment=A terminal for long-running work and AI agents
+Exec=keepterm
+Icon=keepterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupWMClass=keepterm

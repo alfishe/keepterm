@@ -1,0 +1,17 @@
+# Checks that every slice of BINARY has LC_BUILD_VERSION minos == MINOS.
+
+execute_process(COMMAND otool -l "${BINARY}" OUTPUT_VARIABLE out RESULT_VARIABLE rc)
+if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "otool failed on ${BINARY}")
+endif()
+string(REGEX MATCHALL "minos [0-9.]+" found "${out}")
+if(NOT found)
+    message(FATAL_ERROR "no LC_BUILD_VERSION in ${BINARY}")
+endif()
+foreach(m IN LISTS found)
+    string(REPLACE "minos " "" v "${m}")
+    if(NOT v VERSION_EQUAL MINOS)
+        message(FATAL_ERROR "minos ${v}, expected ${MINOS}")
+    endif()
+endforeach()
+message(STATUS "minos ${MINOS}: ok (${found})")

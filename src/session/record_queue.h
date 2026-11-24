@@ -1,0 +1,125 @@
+// A bounded single-producer, single-consumer queue of journal records.
+//
+// The PTY thread pushes a copy of each journal record (journal::Tap); the host's storage
+// thread pops them. push() never waits and never allocates: when the queue is full the record
+// is dropped and counted, and the consumer sees the hole as a jump in the stream offsets. Only
+// two atomics are shared; the bytes live in one preallocated ring.
+//
+// Entry layout in the ring (8-byte aligned): u32 len, u8 kind, 3 pad, u64 seq, u64 ts, payload.
+// An entry never wraps: when it does not fit before the end of the ring, a wrap marker
+// (len = UINT32_MAX) or too little room for a header tells the consumer to go to offset 0.
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <vector>
+
+#include "session/journal.h"
+
+namespace kt::session {
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)  // padded by the alignas(64) counters, on purpose
+#endif
+class RecordQueue final : public journal::Tap {
+public:
+    static constexpr std::size_t kHeader = 24;
+
+    // `capacity` is rounded up to a multiple of 8 and at least 2 x (kHeader + kMaxPayload).
+    explicit RecordQueue(std::size_t capacity) {
+        std::size_t c = (capacity + 7u) & ~std::size_t{7};
+        const std::size_t min = 2 * (kHeader + journal::kMaxPayload + 8);
+        if (c < min) c = min;
+        ring_.resize(c);
+    }
+
+    // Producer side.
+    void record(journal::Kind kind, uint64_t seq, uint64_t unix_ms, std::span<const std::byte> payload) override {
+        const std::size_t need = kHeader + align8(payload.size());
+        const uint64_t tail = tail_.load(std::memory_order_relaxed);
+        const uint64_t head = head_.load(std::memory_order_acquire);
+        const std::size_t cap = ring_.size();
+        std::size_t pos = static_cast<std::size_t>(tail % cap);
+        std::size_t skip = 0;
+        if (pos + need > cap) skip = cap - pos;  // goes to the start; the rest of the ring is a gap
+        if ((tail - head) + skip + need > cap) {
+            dropped_records_.fetch_add(1, std::memory_order_relaxed);
+            dropped_bytes_.fetch_add(payload.size(), std::memory_order_relaxed);
+            return;
+        }
+        if (skip) {
+            if (skip >= kHeader) put32(ring_.data() + pos, UINT32_MAX);
+            pos = 0;
+        }
+        std::byte* p = ring_.data() + pos;
+        put32(p, static_cast<uint32_t>(payload.size()));
+        p[4] = static_cast<std::byte>(kind);
+        p[5] = p[6] = p[7] = std::byte{0};
+        put64(p + 8, seq);
+        put64(p + 16, unix_ms);
+        if (!payload.empty()) std::memcpy(p + kHeader, payload.data(), payload.size());
+        tail_.store(tail + skip + need, std::memory_order_release);
+    }
+
+    // Consumer side. Calls fn(kind, seq, ts, payload) for each queued record, at most
+    // `max_bytes` of payload per call (at least one record); returns the number of records.
+    template <class Fn>
+    std::size_t drain(Fn&& fn, std::size_t max_bytes = SIZE_MAX) {
+        std::size_t n = 0, bytes = 0;
+        uint64_t head = head_.load(std::memory_order_relaxed);
+        const std::size_t cap = ring_.size();
+        for (;;) {
+            const uint64_t tail = tail_.load(std::memory_order_acquire);
+            if (head == tail || (n > 0 && bytes >= max_bytes)) break;
+            std::size_t pos = static_cast<std::size_t>(head % cap);
+            if (cap - pos < kHeader || get32(ring_.data() + pos) == UINT32_MAX) {
+                head += cap - pos;  // wrap
+                head_.store(head, std::memory_order_release);
+                continue;
+            }
+            const std::byte* p = ring_.data() + pos;
+            const uint32_t len = get32(p);
+            const auto kind = static_cast<journal::Kind>(p[4]);
+            fn(kind, get64(p + 8), get64(p + 16), std::span<const std::byte>(p + kHeader, len));
+            head += kHeader + align8(len);
+            head_.store(head, std::memory_order_release);
+            ++n;
+            bytes += len;
+        }
+        return n;
+    }
+
+    bool empty() const { return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire); }
+    uint64_t dropped_records() const { return dropped_records_.load(std::memory_order_relaxed); }
+    uint64_t dropped_bytes() const { return dropped_bytes_.load(std::memory_order_relaxed); }
+    std::size_t capacity() const { return ring_.size(); }
+
+private:
+    static constexpr std::size_t align8(std::size_t n) { return (n + 7u) & ~std::size_t{7}; }
+    static void put32(std::byte* p, uint32_t v) { std::memcpy(p, &v, 4); }
+    static void put64(std::byte* p, uint64_t v) { std::memcpy(p, &v, 8); }
+    static uint32_t get32(const std::byte* p) {
+        uint32_t v;
+        std::memcpy(&v, p, 4);
+        return v;
+    }
+    static uint64_t get64(const std::byte* p) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        return v;
+    }
+
+    std::vector<std::byte> ring_;
+    alignas(64) std::atomic<uint64_t> tail_{0};  // written by the producer
+    alignas(64) std::atomic<uint64_t> head_{0};  // written by the consumer
+    std::atomic<uint64_t> dropped_records_{0}, dropped_bytes_{0};
+};
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+}  // namespace kt::session

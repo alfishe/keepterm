@@ -1,0 +1,17 @@
+# The Windows console palette ("Campbell" of Windows Terminal, MIT, microsoft/terminal),
+# familiar to Windows Server users. The selection is drawn white on the text
+# color of the background, as the console does.
+name = "Campbell"
+appearance = "dark"
+
+[colors]
+background = "#0C0C0C"
+foreground = "#CCCCCC"
+cursor = "#FFFFFF"
+cursor_text = "#0C0C0C"
+selection_background = "#FFFFFF"
+selection_foreground = "#0C0C0C"
+palette = [
+  "#0C0C0C", "#C50F1F", "#13A10E", "#C19C00", "#0037DA", "#881798", "#3A96DD", "#CCCCCC",
+  "#767676", "#E74856", "#16C60C", "#F9F1A5", "#3B78FF", "#B4009E", "#61D6D6", "#F2F2F2",
+]

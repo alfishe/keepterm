@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------- build output
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.dSYM/
+
+# ---------------------------------------------------------------- local runtime data
+# Session snapshots, logs and crash dumps hold host-specific paths: never commit them.
+*.log
+*.dmp
+crash-*/
+
+# ---------------------------------------------------------------- macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# ---------------------------------------------------------------- Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# ---------------------------------------------------------------- Linux
+*~
+.directory
+.Trash-*
+.nfs*
+.fuse_hidden*
+
+# ---------------------------------------------------------------- editors / IDEs
+.idea/
+*.iml
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.code-workspace
+.history/
+*.swp
+*.swo
+*.sublime-workspace
+.project
+.settings/
+xcuserdata/
+
+# ---------------------------------------------------------------- local agent / secrets
+.claude/settings.local.json
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------- not published yet
+# Tests and design documents live outside this repository for now.
+/tests/
+/docs/
+/TODO.md

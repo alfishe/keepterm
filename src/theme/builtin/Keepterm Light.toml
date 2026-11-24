@@ -1,0 +1,17 @@
+# keepterm's default light theme.
+name = "Keepterm Light"
+appearance = "light"
+
+[colors]
+background = "#FAFAFB"
+foreground = "#24292F"
+cursor = "#1F2329"
+cursor_text = "#FAFAFB"
+selection_background = "#C9D8F5"
+selection_foreground = ""
+accent = "#2F6FEB"
+link = "#2F6FEB"
+palette = [
+  "#1F2329", "#C9353F", "#2E8540", "#A06A00", "#2F6FEB", "#8A4FD8", "#16818A", "#6B7280",
+  "#5A6170", "#E04452", "#3A9E52", "#C08A10", "#4C86F0", "#A36AE6", "#2496A0", "#9CA3AF",
+]

@@ -1,0 +1,17 @@
+# keepterm's earlier dark theme: a near-black background with high-contrast text.
+name = "Keepterm Dark Contrast"
+appearance = "dark"
+
+[colors]
+background = "#16181D"
+foreground = "#D5D8DE"
+cursor = "#E6E9EF"
+cursor_text = "#16181D"
+selection_background = "#33405A"
+selection_foreground = ""
+accent = "#5B9BFF"
+link = "#7DB2FF"
+palette = [
+  "#1C1F26", "#E5555B", "#5FC27A", "#E0B04F", "#5B9BFF", "#B77FE0", "#4FC1C9", "#C6CAD2",
+  "#555B67", "#FF6E73", "#7BD994", "#F2C76A", "#7DB2FF", "#CC9AF0", "#6FD6DD", "#F2F4F7",
+]

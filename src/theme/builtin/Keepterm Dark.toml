@@ -1,0 +1,18 @@
+# keepterm's default dark theme: Macterm's dark look, a soft violet-gray
+# background with lavender text rather than a near-black, high-contrast one.
+name = "Keepterm Dark"
+appearance = "dark"
+
+[colors]
+background = "#302F3A"
+foreground = "#E0DEF4"
+cursor = "#E0DEF4"
+cursor_text = "#302F3A"
+selection_background = "#4A4960"
+selection_foreground = ""
+accent = "#5290FF"
+link = "#7AA8FF"
+palette = [
+  "#3A3946", "#EE5D55", "#4EBB65", "#F4C10D", "#5290FF", "#BF7AF0", "#56C2D6", "#C9C7DC",
+  "#6E6C80", "#FF7A70", "#6CD483", "#FFD54A", "#7AA8FF", "#D49CF8", "#7DD8E8", "#F4F2FF",
+]

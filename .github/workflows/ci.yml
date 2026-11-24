@@ -1,0 +1,135 @@
+# ==============================================================================
+# CI: every push to main and every pull request
+# ==============================================================================
+#
+# Builds keepterm with warnings as errors on Linux (gcc, clang), macOS and Windows and starts
+# the result: the version, a program on a PTY and, where fonts are present, a screen rendered
+# to PNG. The lint job checks that the committed icon files are what tools/gen_icon.py draws.
+# Release packages: release.yml.
+#
+# ==============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  workflow_dispatch:
+
+# A newer push to the same branch or pull request replaces a running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Icon files match the generator
+        run: python3 tools/gen_icon.py --check
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ninja-build fontconfig fonts-dejavu-core
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DKT_WERROR=ON \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run
+        run: |
+          build/src/keepterm --version
+          build/src/keepterm --pty-run -- sh -c 'echo pty-ok' | tr -d '\r' | grep -q pty-ok
+          build/src/keepterm --pty-render "$RUNNER_TEMP/screen.png" --size 40x5 -- sh -c 'echo render-ok'
+          test -s "$RUNNER_TEMP/screen.png"
+
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DKT_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run
+        run: |
+          build/src/keepterm --version
+          build/src/keepterm --pty-run -- sh -c 'echo pty-ok' | tr -d '\r' | grep -q pty-ok
+          build/src/keepterm --pty-render "$RUNNER_TEMP/screen.png" --size 40x5 -- sh -c 'echo render-ok'
+          test -s "$RUNNER_TEMP/screen.png"
+
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup MSVC
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DKT_WERROR=ON
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: Run
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: '1'   # keep cmd's /c as it is
+        run: |
+          build/src/keepterm.exe --version
+          build/src/keepterm.exe --pty-run -- cmd /c echo pty-ok | tr -d '\r' | grep -q pty-ok

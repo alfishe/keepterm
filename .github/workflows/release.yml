@@ -1,0 +1,403 @@
+# ==============================================================================
+# Release packages
+# ==============================================================================
+#
+# Two release modes:
+#
+# 1. ROLLING SNAPSHOT: "Run workflow" on main
+#    - Creates or replaces the single "continuous" pre-release (no tag accumulation)
+#    - Stable download URL: /releases/tag/continuous
+#    - "Run workflow" on any other branch builds and verifies the packages without
+#      publishing anything
+#
+# 2. MILESTONE RELEASE: pushing a v* tag (v0.1.0, ...)
+#    - A permanent release; the tag must equal project(VERSION) in CMakeLists.txt
+#
+# Packages (one file per platform and architecture, keepterm-<OS>-<arch>.<ext>):
+#   Linux    x86_64   .tar.gz (portable) and .deb
+#   macOS    arm64, x86_64   .dmg (macOS 13+), one per architecture
+#   Windows  x86_64   portable .zip
+#
+# Every binary is stripped and needs nothing beyond the OS: the C and C++ runtimes are
+# static except glibc on Linux, which is the oldest one the packages support (built in
+# manylinux_2_28: glibc 2.28, RHEL 8 / Debian 10 / Ubuntu 18.10 and newer). X11, fontconfig,
+# D-Bus and Vulkan are opened at run time. cmake/VerifyPackage.cmake checks each package.
+#
+# Signing: none yet. The macOS bundle is signed ad hoc.
+#
+# ==============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  # Pull requests that touch the build or the packaging build all packages (nothing is published).
+  pull_request:
+    branches: [main]
+    paths:
+      - 'CMakeLists.txt'
+      - '**/CMakeLists.txt'
+      - '**/module.cmake'
+      - 'cmake/**'
+      - 'assets/**'
+      - 'third_party/MANIFEST.toml'
+      - '.github/workflows/release.yml'
+
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Only the publishing job can modify releases or tags.
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+  MACOS_DEPLOYMENT_TARGET: '13.0'
+  GLIBC_MAX: '2.28'
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package-version: ${{ steps.version.outputs.package }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # project(VERSION) is the version; a snapshot's packages add the run number
+      # (deb version, CFBundleVersion), a tag must equal it.
+      - name: Read the version
+        id: version
+        run: |
+          v=$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -1)
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [ "${GITHUB_REF_NAME#v}" != "$v" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match project(VERSION) $v"; exit 1
+            fi
+            echo "package=$v" >> "$GITHUB_OUTPUT"
+          else
+            echo "package=$v.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ========================================
+  # Linux: tar.gz + DEB, built against glibc 2.28
+  # ========================================
+  build-linux:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DKT_BUILD_TESTS=OFF -DKT_WERROR=ON \
+            -DKT_PACKAGE_VERSION=${{ needs.metadata.outputs.package-version }}
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Package
+        working-directory: build
+        run: cpack -G "TGZ;DEB"
+
+      - name: Verify packages
+        run: |
+          for p in build/packages/keepterm-Linux-x86_64.tar.gz build/packages/keepterm-Linux-x86_64.deb; do
+            cmake -DPACKAGE="$PWD/$p" -DVERSION=${{ needs.metadata.outputs.version }} \
+              -DGLIBC_MAX=${{ env.GLIBC_MAX }} -P cmake/VerifyPackage.cmake
+          done
+
+      - name: Upload tar.gz
+        uses: actions/upload-artifact@v7
+        with:
+          name: keepterm-Linux-x86_64.tar.gz
+          path: build/packages/keepterm-Linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v7
+        with:
+          name: keepterm-Linux-x86_64.deb
+          path: build/packages/keepterm-Linux-x86_64.deb
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # The packages in clean systems: the oldest glibc the packages support and newer ones.
+  # Headless: the version, a program on a PTY, a screen rendered to PNG (fonts, renderer).
+  verify-linux:
+    needs: [metadata, build-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: 'almalinux:8'     # glibc 2.28
+            package: tar.gz
+          - image: 'ubuntu:20.04'
+            package: deb
+          - image: 'debian:12'
+            package: deb
+          - image: 'ubuntu:24.04'
+            package: deb
+          - image: 'ubuntu:24.04'
+            package: tar.gz
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: keepterm-Linux-x86_64.${{ matrix.package }}
+          path: packages
+
+      - name: Install
+        run: |
+          if command -v dnf > /dev/null; then
+            dnf -y -q install fontconfig dejavu-sans-mono-fonts
+          else
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fontconfig fonts-dejavu-core
+          fi
+          if [ "${{ matrix.package }}" = deb ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ./packages/keepterm-Linux-x86_64.deb
+            dpkg -s keepterm | grep -E '^(Version|Depends):'
+            test -f /usr/share/applications/keepterm.desktop
+            test -f /usr/share/icons/hicolor/256x256/apps/keepterm.png
+            echo "KT=keepterm" >> "$GITHUB_ENV"
+          else
+            tar -xzf packages/keepterm-Linux-x86_64.tar.gz -C /opt
+            echo "KT=/opt/keepterm-Linux-x86_64/bin/keepterm" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run
+        run: |
+          "$KT" --version | grep -x "keepterm ${{ needs.metadata.outputs.version }}"
+          "$KT" --pty-run -- sh -c 'echo pty-ok' | tr -d '\r' | grep -q pty-ok
+          "$KT" --pty-render /tmp/screen.png --size 40x5 -- sh -c 'echo render-ok'
+          test -s /tmp/screen.png
+
+  # ========================================
+  # Windows x86_64 (MSVC, static CRT)
+  # ========================================
+  build-windows:
+    needs: metadata
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup MSVC
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DKT_BUILD_TESTS=OFF -DKT_WERROR=ON \
+            -DKT_PACKAGE_VERSION=${{ needs.metadata.outputs.package-version }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: Package
+        shell: bash
+        working-directory: build
+        run: cpack -G ZIP
+
+      # dumpbin (the MSVC shell) checks the imports: no VC++ runtime DLL.
+      - name: Verify package
+        shell: bash
+        run: |
+          cmake -DPACKAGE="$PWD/build/packages/keepterm-Windows-x86_64.zip" \
+            -DVERSION=${{ needs.metadata.outputs.version }} -P cmake/VerifyPackage.cmake
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: keepterm-Windows-x86_64.zip
+          path: build/packages/keepterm-Windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ========================================
+  # macOS: one DMG per architecture
+  # ========================================
+  build-macos:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DKT_BUILD_TESTS=OFF -DKT_WERROR=ON \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ env.MACOS_DEPLOYMENT_TARGET }} \
+            -DKT_PACKAGE_VERSION=${{ needs.metadata.outputs.package-version }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        working-directory: build
+        run: cpack -G DragNDrop
+
+      - name: Verify package
+        run: |
+          cmake -DPACKAGE="$PWD/build/packages/keepterm-macOS-${{ matrix.arch }}.dmg" \
+            -DVERSION=${{ needs.metadata.outputs.version }} -DARCH=${{ matrix.arch }} \
+            -DMINOS=${{ env.MACOS_DEPLOYMENT_TARGET }} -P cmake/VerifyPackage.cmake
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: keepterm-macOS-${{ matrix.arch }}.dmg
+          path: build/packages/keepterm-macOS-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ========================================
+  # GitHub release
+  # ========================================
+  #
+  # - workflow_dispatch on main → rolling snapshot (replaces the "continuous" release and tag)
+  # - tag push (v*)            → milestone release (permanent)
+  #
+  release:
+    needs: [metadata, build-linux, verify-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # Every artifact holds exactly one file, already carrying its final name.
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          cat > downloads.md <<'EOF'
+          ### Downloads
+
+          | Platform | File |
+          |----------|------|
+          | Linux x86_64, portable (glibc 2.28+: RHEL 8, Debian 10, Ubuntu 18.10 and newer) | `keepterm-Linux-x86_64.tar.gz` |
+          | Linux x86_64, Debian / Ubuntu | `keepterm-Linux-x86_64.deb` |
+          | macOS 13+, Apple Silicon | `keepterm-macOS-arm64.dmg` |
+          | macOS 13+, Intel | `keepterm-macOS-x86_64.dmg` |
+          | Windows 10 / Server 2016 and newer, x86_64 | `keepterm-Windows-x86_64.zip` |
+
+          Nothing else needs to be installed. The Linux tar.gz unpacks anywhere: `bin/keepterm` runs from
+          there (`share/` holds the desktop file, icons and shell completions).
+
+          ### Unsigned builds
+
+          The packages are not signed yet.
+          - **macOS:** the first start is refused ("cannot be verified"). Allow it in System Settings →
+            Privacy & Security → "Open Anyway", or run `xattr -dr com.apple.quarantine /Applications/keepterm.app`.
+          - **Windows:** SmartScreen may warn: "More info" → "Run anyway".
+
+          ### Verify downloads
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+          EOF
+
+      - name: Create rolling snapshot
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.metadata.outputs.package-version }}"
+          DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          {
+            echo "## Rolling snapshot"
+            echo
+            echo "**Version:** \`$VERSION\`"
+            echo "**Commit:** [\`$SHORT_SHA\`](https://github.com/${{ github.repository }}/commit/$GITHUB_SHA)"
+            echo "**Built:** $DATE"
+            echo
+            echo "> This is a development snapshot, replaced by every new snapshot build."
+            echo
+            cat downloads.md
+          } > notes.md
+          gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
+          gh release create continuous \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Snapshot $VERSION" \
+            --notes-file notes.md \
+            release/*
+
+      - name: Prepare milestone notes
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          {
+            echo "## keepterm ${{ github.ref_name }}"
+            echo
+            cat downloads.md
+          } > notes.md
+
+      - name: Create milestone release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: keepterm ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          generate_release_notes: true
+          body_path: notes.md
+          files: release/*
