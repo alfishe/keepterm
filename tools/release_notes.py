@@ -23,7 +23,29 @@ def section(text: str, version: str) -> str:
             continue
         if inside:
             out.append(line)
-    return "\n".join(out).strip()
+    return "\n".join(unwrap(out)).strip()
+
+
+BLOCK_START = re.compile(r"^(#|\||```|[-*+] |\d+\. |> )")
+
+
+def unwrap(lines):
+    """Joins hard-wrapped lines: GitHub shows every newline of a release body as a line break."""
+    out, fence = [], False
+    for line in lines:
+        text = line.strip()
+        if text.startswith("```"):
+            fence = not fence
+            out.append(line)
+            continue
+        prev = out[-1].strip() if out else ""
+        joinable = (not fence and text and prev and not BLOCK_START.match(text)
+                    and not prev.startswith(("#", "|", "```")))
+        if joinable:
+            out[-1] = out[-1].rstrip() + " " + text
+        else:
+            out.append(line)
+    return out
 
 
 def main() -> int:

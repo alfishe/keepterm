@@ -338,16 +338,14 @@ jobs:
           | Linux x86_64, Debian / Ubuntu | `keepterm-Linux-x86_64.deb` |
           | macOS 13+, Apple Silicon | `keepterm-macOS-arm64.dmg` |
           | macOS 13+, Intel | `keepterm-macOS-x86_64.dmg` |
-          | Windows 10 / Server 2016 and newer, x86_64 | `keepterm-Windows-x86_64.zip` |
+          | Windows 10, 11, Windows Server 2016 and newer, x86_64 | `keepterm-Windows-x86_64.zip` |
 
-          Nothing else needs to be installed. The Linux tar.gz unpacks anywhere: `bin/keepterm` runs from
-          there (`share/` holds the desktop file, icons and shell completions).
+          Nothing else needs to be installed. The Linux tar.gz unpacks anywhere: `bin/keepterm` runs from there (`share/` holds the desktop file, icons and shell completions).
 
           ### Unsigned builds
 
           The packages are not signed yet.
-          - **macOS:** the first start is refused ("cannot be verified"). Allow it in System Settings →
-            Privacy & Security → "Open Anyway", or run `xattr -dr com.apple.quarantine /Applications/keepterm.app`.
+          - **macOS:** the first start is refused ("cannot be verified"). Allow it in System Settings → Privacy & Security → "Open Anyway", or run `xattr -dr com.apple.quarantine /Applications/keepterm.app`.
           - **Windows:** SmartScreen may warn: "More info" → "Run anyway".
 
           ### Verify downloads

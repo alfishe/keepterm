@@ -24,7 +24,7 @@ First public release.
   private and read-only panes, command palette, rebindable keymaps, resource monitor.
 - **Themes:** built-in light, dark and high-contrast, iTerm2-Color-Schemes and Ghostty theme files,
   follows the OS light/dark mode.
-- **Platforms:** Windows 10 and Server 2016+ (own console agent on 1607, ConPTY on 1809+), macOS 13+
+- **Platforms:** Windows 10, 11 and Windows Server 2016+ (own console agent on 1607, ConPTY on 1809+), macOS 13+
   (arm64, x86_64), Linux x86_64 (glibc 2.28+); Direct3D 11, Metal, Vulkan and CPU renderers.
 
 Known gaps: the history store is off by default, no native Wayland backend, no terminal images,

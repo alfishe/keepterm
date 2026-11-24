@@ -2,7 +2,11 @@
 
 **keepterm is an AI-aware terminal.** It knows which coding agent runs in each pane, shows how full the agent's context window is, lets the agent drive the terminal itself, and brings the whole workspace back after a restart or a reboot: tabs, splits, folders, screens and the agent conversations.
 
-One native executable for Windows (Server 2016 included), macOS and Linux, with or without a GPU.
+One native executable, with or without a GPU, for:
+
+- **Windows** 10 and 11, Windows Server 2016 and newer (x64)
+- **macOS** 13 and newer (Apple silicon and Intel)
+- **Linux** x86_64 with glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 18.10 and newer)
 
 | Dark | Light |
 |---|---|
@@ -49,7 +53,7 @@ One native executable for Windows (Server 2016 included), macOS and Linux, with 
 
 | Package | System | Terminal backend | Renderers |
 |---|---|---|---|
-| `keepterm-Windows-x86_64.zip` | Windows 10 / Server 2016 or newer, x64 | console agent (1607), ConPTY (1809+) | Direct3D 11, CPU |
+| `keepterm-Windows-x86_64.zip` | Windows 10, 11, Windows Server 2016 or newer, x64 | console agent (1607), ConPTY (1809+) | Direct3D 11, CPU |
 | `keepterm-macOS-arm64.dmg` | macOS 13+, Apple silicon | POSIX pty | Metal, CPU |
 | `keepterm-macOS-x86_64.dmg` | macOS 13+, Intel | POSIX pty | Metal, CPU |
 | `keepterm-Linux-x86_64.tar.gz` | Linux x86_64, glibc 2.28+ | POSIX pty | Vulkan, CPU |
