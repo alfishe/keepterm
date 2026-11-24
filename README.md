@@ -4,7 +4,11 @@
 
 One native executable for Windows (Server 2016 included), macOS and Linux, with or without a GPU.
 
-> **Status:** early development. Snapshot builds are on the [Releases](../../releases) page; there is no stable release yet.
+| Dark | Light |
+|---|---|
+| ![keepterm, dark theme: three projects with tabs, Claude Code and a shell side by side](assets/screenshots/keepterm-dark.png) | ![keepterm, light theme: the same workspace](assets/screenshots/keepterm-light.png) |
+
+> **Status:** early development. Packages are on the [Releases](../../releases) page; changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## What it does for agents
 
