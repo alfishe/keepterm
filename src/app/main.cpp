@@ -46,6 +46,11 @@
 #include "resources/cli.h"
 #endif
 #ifdef KT_HAVE_STORE
+#include <filesystem>
+
+#include "platform/paths.h"
+#include "session/history_index.h"  // keepterm --history list | show | restore | ...
+#include "session/os.h"
 #include "store/cli.h"   // keepterm --history du | search | forget | backfill
 #endif
 #ifdef KT_HAVE_PTY_RENDER
@@ -306,7 +311,19 @@ int main(int argc, char** argv) {
     if (cmd == "--resources") return kt::resources::resources_cli(argc, argv, 2, kt::app::live_session_processes);
 #endif
 #ifdef KT_HAVE_STORE
-    if (cmd == "--history") return kt::store::history_cli(argc, argv, 2);
+    if (cmd == "--history") {
+        // The sessions of the history; the rest works on the store itself.
+        if (argc > 2 && kt::session::is_history_index_command(argv[2])) return kt::session::history_index_cli(argc, argv, 2);
+        // The store the hosts of this profile write (KEEPTERM_STATE_DIR, KEEPTERM_PROFILE).
+        std::filesystem::path root;
+        if (auto p = kt::session::os::paths()) root = kt::platform::paths::from_utf8(p->state) / "history";
+        // Retention per project needs the manifests (the session layer); --root runs without.
+        auto per_session = [](const kt::config::Config& cfg) -> kt::store::Janitor::PolicyFor {
+            auto p = kt::session::os::paths();
+            return p ? kt::session::history_policy_for(cfg, *p) : kt::store::Janitor::PolicyFor{};
+        };
+        return kt::store::history_cli(argc, argv, 2, root, per_session);
+    }
 #endif
 #ifdef _WIN32
     if (cmd == "--console-agent") {

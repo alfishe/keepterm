@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 
+#include <psapi.h>
 #include <sddl.h>
 #include <fcntl.h>
 #include <io.h>
@@ -16,11 +17,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <vector>
 
 #include "platform/paths.h"
 #include "pty/util_win.h"
@@ -529,9 +533,12 @@ std::string self_exe() {
     return narrow(buf);
 }
 
-Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono::milliseconds timeout) {
+Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono::milliseconds timeout,
+                               const std::function<void()>& before_wait) {
     if (args.empty()) return make_error(Errc::invalid_argument, "empty argv");
     Spawned out;
+    // The timeout covers the whole start, the wait for the intermediate child included.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     bool uses_ready = false;
     for (const auto& a : args) uses_ready = uses_ready || a.find("{ready}") != std::string::npos;
 
@@ -608,10 +615,17 @@ Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono
         out.ready_line = "OK";
         return out;
     }
+    if (before_wait) before_wait();
     // Anonymous pipes have no overlapped reads: poll with PeekNamedPipe.
     std::string line;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Written off, a line already in the pipe or not: the child ends (one whose line lands
+            // between the last look and the close of the pipe would otherwise live on unseen).
+            ::TerminateProcess(proc.get(), 1);
+            ::WaitForSingleObject(proc.get(), 5000);
+            return make_error(Errc::timeout, "session host did not report ready");
+        }
         DWORD avail = 0;
         if (!::PeekNamedPipe(rd.get(), nullptr, 0, nullptr, &avail, nullptr)) break;   // writer closed
         if (avail) {
@@ -622,7 +636,6 @@ Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono
             if (line.find('\n') != std::string::npos) break;
             continue;
         }
-        if (std::chrono::steady_clock::now() >= deadline) return make_error(Errc::timeout, "session host did not report ready");
         ::Sleep(5);
     }
     if (const auto nl = line.find('\n'); nl != std::string::npos) line.resize(nl);
@@ -640,6 +653,62 @@ bool signal_ready(int64_t handle, std::string_view line) {
     const BOOL ok = ::WriteFile(h, l.data(), static_cast<DWORD>(l.size()), &n, nullptr);
     ::CloseHandle(h);
     return ok && n == l.size();
+}
+
+std::size_t LazyPages::page_size() {
+    static const std::size_t n = [] {
+        SYSTEM_INFO si;
+        ::GetSystemInfo(&si);
+        return static_cast<std::size_t>(si.dwPageSize);
+    }();
+    return n;
+}
+
+LazyPages::LazyPages(std::size_t bytes) {
+    const std::size_t pg = page_size();
+    const std::size_t n = (std::max<std::size_t>(bytes, 1) + pg - 1) / pg * pg;
+    // Committed (charged to the commit limit) but not in the working set until written.
+    void* m = ::VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!m) throw std::bad_alloc();
+    p_ = static_cast<std::byte*>(m);
+    n_ = n;
+}
+
+LazyPages& LazyPages::operator=(LazyPages&& o) noexcept {
+    if (this != &o) {
+        LazyPages old(std::move(*this));
+        p_ = o.p_;
+        n_ = o.n_;
+        o.p_ = nullptr;
+        o.n_ = 0;
+    }
+    return *this;
+}
+
+LazyPages::~LazyPages() {
+    if (p_) ::VirtualFree(p_, 0, MEM_RELEASE);
+}
+
+void LazyPages::discard(std::size_t off, std::size_t len) {
+    const std::size_t pg = page_size();
+    if (off >= n_) return;
+    len = std::min(len, n_ - off);
+    const std::size_t a = (off + pg - 1) / pg * pg, b = (off + len) / pg * pg;
+    if (b <= a) return;
+    // Windows 8.1 and later: the pages leave the working set and stay committed, so the next
+    // write cannot fail for want of commit. Not a fallible decommit and recommit.
+    (void)::DiscardVirtualMemory(p_ + a, b - a);
+}
+
+std::size_t LazyPages::resident_bytes() const {
+    if (!p_) return 0;
+    const std::size_t pg = page_size();
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> v(n_ / pg);
+    for (std::size_t i = 0; i < v.size(); ++i) v[i].VirtualAddress = p_ + i * pg;
+    if (!::QueryWorkingSetEx(::GetCurrentProcess(), v.data(), static_cast<DWORD>(v.size() * sizeof(v[0])))) return 0;
+    std::size_t r = 0;
+    for (const auto& e : v) r += e.VirtualAttributes.Valid ? pg : 0;
+    return r;
 }
 
 void release_free_memory() {

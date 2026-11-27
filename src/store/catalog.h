@@ -77,7 +77,8 @@ public:
 
     int schema_version() const { return version_; }
 
-    // Sessions. upsert keeps started_ms, ended_ms and pinned of an existing row.
+    // Sessions. upsert keeps started_ms and pinned of an existing row and clears ended_ms (a
+    // restored series runs again).
     Result<void> upsert_session(const SessionRow&);
     Result<void> end_session(const std::string& id, uint64_t ended_ms);
     Result<void> set_pinned(const std::string& id, bool pinned);
@@ -103,6 +104,8 @@ public:
     Result<std::vector<PinRow>> pins();
 
     Result<int64_t> add_command(const CommandRow&);
+    // Sets the end of a command row added when it started.
+    Result<void> finish_command(int64_t id, uint64_t ended_ms, std::optional<int> exit_code);
     Result<std::vector<CommandRow>> commands(const std::string& session);
 
 private:

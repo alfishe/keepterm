@@ -55,7 +55,7 @@ std::string format_ctx(Ctx c);
 // Parses one context name ("terminal", "find_bar", "palette" ...), case-insensitive.
 bool parse_ctx_name(std::string_view name, Ctx& out);
 
-enum class PaletteScope : std::uint8_t { Root, Files, Sessions, Tabs, Folders, MoveTabToProject, Workspaces };
+enum class PaletteScope : std::uint8_t { Root, Files, Sessions, Tabs, Folders, MoveTabToProject, Workspaces, History };
 std::string_view scope_name(PaletteScope s);   // "files", "sessions", ...
 
 enum class InvokeSource : std::uint8_t { Keymap, Palette, Menu, Cli, Toolbar };

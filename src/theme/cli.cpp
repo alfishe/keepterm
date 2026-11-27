@@ -63,6 +63,7 @@ struct Common {
 
 // Parses --profile NAME, --color, --no-color, --toml, --all; the rest are arguments.
 bool parse_common(int argc, char** argv, int i, Common& c) {
+    if (auto prof = platform::paths::env_utf8("KEEPTERM_PROFILE"); prof && platform::paths::valid_profile_name(*prof)) c.profile = *prof;
     for (; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--profile") {

@@ -172,6 +172,14 @@ private:
     bool focus_visible_ = false;
     bool window_focused_ = true;
     Widget* capture_ = nullptr;
+    Widget* pressed_ = nullptr;                      // the press target while its handlers run
+    // Widget paths that handlers are being called along: a handler may remove widgets (its own
+    // included), and forget() blanks them here so that nothing calls into a removed widget.
+    std::vector<std::vector<Widget*>*> guarded_;
+    // Calls fn(w) from `start` up to the root, skipping removed and disabled widgets, until it
+    // returns true.
+    template <typename F> bool bubble(Widget* start, F fn);
+    void text_metrics_changed();   // on_text_metrics_changed on every widget
     std::vector<Widget*> hover_path_;
     Vec2 pointer_{-1, -1};
     bool pointer_inside_ = false;

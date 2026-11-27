@@ -18,7 +18,7 @@ One native executable, with or without a GPU, for:
 
 - **Knows the agent.** Claude Code, Codex, Qoder CLI, Antigravity, Gemini CLI, Copilot CLI, Cursor Agent, OpenCode and Grok are recognized in a pane from the process tree; the tab shows which one runs. Your own CLIs go into `[[agents.custom]]`.
 - **Shows the context.** For Claude Code, Codex, Qoder CLI and Antigravity, the tab shows how full the context window is, read from the agent's own session files. `keepterm --agent-limits` shows the Claude usage limits. Only usage numbers are read, never message text.
-- **Lets the agent drive.** An MCP server (`keepterm mcp config` prints the `.mcp.json` entry) and the control CLI give an agent the terminal: open tabs and splits, run a command in another pane, read its output, send keys. Inside a pane, every command targets that pane by default.
+- **Lets the agent drive.** An MCP server (`keepterm mcp config` prints the `.mcp.json` entry) gives an agent everything the CLI can do: open tabs and splits, run a command in another pane, read its output, send keys, list and inspect sessions, search the history, read resources, config and themes. Its `search` tool finds a command and its arguments by keywords. Inside a pane, every command targets that pane by default; the CLI does the same for scripts.
 - **Brings the conversation back.** After a reboot, a pane that ran Claude Code, Codex, Qoder CLI or Antigravity starts its shell in the same folder and resumes the same conversation (`--resume <id>` or the agent's equivalent).
 
 ## How it integrates
@@ -78,7 +78,6 @@ On Windows, use a "x64 Native Tools" prompt of Visual Studio 2022. Packages: `cp
 
 ## Not there yet
 
-- Searchable history of everything a session printed: the store exists, but it is off by default.
 - A native Wayland backend, OpenGL, Vulkan on Windows, LCD subpixel text.
 - Images in the terminal (sixel, kitty graphics), the kitty keyboard protocol.
 - Remote projects over SSH, Windows arm64, Linux arm64 packages, signed builds.

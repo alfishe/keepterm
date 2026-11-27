@@ -11,8 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <vector>
 
 #include <dirent.h>
 #include <pthread.h>
@@ -21,6 +24,7 @@
 #include <pwd.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -582,11 +586,47 @@ std::string self_exe() {
 #endif
 }
 
-Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono::milliseconds timeout) {
+namespace {
+
+// The ready channel is a socket pair: the host writes its line, the spawner answers the line it
+// takes with one byte. Writes never raise SIGPIPE (a GUI does not ignore it).
+ssize_t send_all(int fd, const char* p, std::size_t n) {
+    std::size_t done = 0;
+    while (done < n) {
+#ifdef MSG_NOSIGNAL
+        const ssize_t w = ::send(fd, p + done, n - done, MSG_NOSIGNAL);
+#else
+        const ssize_t w = ::send(fd, p + done, n - done, 0);   // SO_NOSIGPIPE is set
+#endif
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        done += static_cast<std::size_t>(w);
+    }
+    return static_cast<ssize_t>(done);
+}
+
+void no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    const int on = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#else
+    (void)fd;
+#endif
+}
+
+constexpr int kReadyAckWaitMs = 120'000;   // far above any spawner's timeout
+
+}  // namespace
+
+Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono::milliseconds timeout,
+                               const std::function<void()>& before_wait) {
     if (args.empty()) return make_error(Errc::invalid_argument, "empty argv");
     int ready[2];
-    if (::pipe(ready) != 0) return last_os_error("pipe");
+    // The timeout covers the whole start, the wait for the intermediate child included.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, ready) != 0) return last_os_error("socketpair");
     for (int fd : ready) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    no_sigpipe(ready[0]);
 
     // Everything is prepared before fork: after it only async-signal-safe calls.
     std::vector<std::string> a = args;
@@ -646,8 +686,10 @@ Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono
         out.ready_line = "OK";
         return out;
     }
+    if (before_wait) before_wait();
+    // Past the deadline the channel closes unacknowledged, a line already sent or not: the host
+    // reads the end of the channel and ends.
     std::string line;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
         if (left.count() <= 0) {
@@ -665,6 +707,7 @@ Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono
         line.append(buf, static_cast<std::size_t>(got));
         if (line.find('\n') != std::string::npos) break;
     }
+    if (line.find('\n') != std::string::npos) (void)send_all(ready[0], "\n", 1);   // taken
     ::close(ready[0]);
     if (const auto nl = line.find('\n'); nl != std::string::npos) line.resize(nl);
     if (line.empty()) return make_error(Errc::unavailable, "session host exited before it was ready");
@@ -675,12 +718,90 @@ Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono
 
 bool signal_ready(int64_t handle, std::string_view line) {
     if (handle < 0) return true;
+    const int fd = static_cast<int>(handle);
+    no_sigpipe(fd);
     const std::string l = std::string(line) + "\n";
-    ssize_t n;
-    do n = ::write(static_cast<int>(handle), l.data(), l.size());
-    while (n < 0 && errno == EINTR);
-    ::close(static_cast<int>(handle));
-    return n == static_cast<ssize_t>(l.size());
+    bool taken = false;
+    if (send_all(fd, l.data(), l.size()) == static_cast<ssize_t>(l.size())) {
+        // The spawner's answer: one byte when it takes the line, the end of the channel when it
+        // gave up (a line sent just before its deadline included).
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kReadyAckWaitMs);
+        for (;;) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (left.count() <= 0) break;
+            pollfd pfd{fd, POLLIN, 0};
+            const int n = ::poll(&pfd, 1, static_cast<int>(left.count()));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            char ack = 0;
+            const ssize_t got = ::read(fd, &ack, 1);
+            if (got < 0 && errno == EINTR) continue;
+            taken = got == 1;
+            break;
+        }
+    }
+    ::close(fd);
+    return taken;
+}
+
+std::size_t LazyPages::page_size() {
+    static const std::size_t n = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    return n;
+}
+
+LazyPages::LazyPages(std::size_t bytes) {
+    const std::size_t pg = page_size();
+    const std::size_t n = (std::max<std::size_t>(bytes, 1) + pg - 1) / pg * pg;
+    void* m = ::mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) throw std::bad_alloc();
+    p_ = static_cast<std::byte*>(m);
+    n_ = n;
+}
+
+LazyPages& LazyPages::operator=(LazyPages&& o) noexcept {
+    if (this != &o) {
+        LazyPages old(std::move(*this));
+        p_ = o.p_;
+        n_ = o.n_;
+        o.p_ = nullptr;
+        o.n_ = 0;
+    }
+    return *this;
+}
+
+LazyPages::~LazyPages() {
+    if (p_) ::munmap(p_, n_);
+}
+
+void LazyPages::discard(std::size_t off, std::size_t len) {
+    const std::size_t pg = page_size();
+    if (off >= n_) return;
+    len = std::min(len, n_ - off);
+    const std::size_t a = (off + pg - 1) / pg * pg, b = (off + len) / pg * pg;
+    if (b <= a) return;
+#if defined(__APPLE__)
+    // MADV_DONTNEED keeps the pages on macOS until memory is short, and MADV_FREE_REUSABLE wants a
+    // MADV_FREE_REUSE before each reuse; a fresh mapping in place frees them at once (the kernel
+    // swaps the entries under the map lock, so a failure leaves the old pages, not a hole).
+    (void)::mmap(p_ + a, b - a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+#else
+    // Private anonymous pages are freed at once and read as zero afterwards.
+    (void)::madvise(p_ + a, b - a, MADV_DONTNEED);
+#endif
+}
+
+std::size_t LazyPages::resident_bytes() const {
+    if (!p_) return 0;
+    const std::size_t pg = page_size();
+#if defined(__APPLE__)
+    std::vector<char> v(n_ / pg);
+#else
+    std::vector<unsigned char> v(n_ / pg);
+#endif
+    if (::mincore(p_, n_, v.data()) != 0) return 0;
+    std::size_t r = 0;
+    for (const auto c : v) r += (c & 1) ? pg : 0;
+    return r;
 }
 
 void release_free_memory() {

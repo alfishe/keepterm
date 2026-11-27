@@ -45,7 +45,19 @@ endif()
 
 if(KT_SANITIZE)
     if(MSVC)
-        add_compile_options(/fsanitize=address)
+        # The instrumentation adds sections: large units (main_window.cpp) exceed the COFF limit.
+        add_compile_options(/fsanitize=address /bigobj)
+        # The ASan runtime DLL sits by cl.exe, found through the PATH of a developer prompt only:
+        # processes started apart from it (the session host) fail with STATUS_DLL_NOT_FOUND.
+        # Each directory of executables gets a copy.
+        get_filename_component(kt_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        file(GLOB kt_asan_dlls "${kt_cl_dir}/clang_rt.asan*_dynamic-x86_64.dll")
+        if(NOT kt_asan_dlls)
+            message(WARNING "ASan runtime DLL not found next to ${CMAKE_CXX_COMPILER}")
+        endif()
+        foreach(kt_dir "" src)
+            file(COPY ${kt_asan_dlls} DESTINATION "${CMAKE_BINARY_DIR}/${kt_dir}")
+        endforeach()
     else()
         string(REPLACE ";" "," kt_san "${KT_SANITIZE}")
         add_compile_options(-fsanitize=${kt_san} -fno-omit-frame-pointer)

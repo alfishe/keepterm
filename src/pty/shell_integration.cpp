@@ -90,10 +90,17 @@ if [ "$KEEPTERM_SHELL_INTEGRATION" != 0 ] && [ -z "$__kt_loaded" ]; then
     if [ -z "$KEEPTERM_INTEGRATION" ] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
         PS0="${PS0}"$'\e]133;C\e\\'
     fi
+    # The end of the prompt (OSC 133 B), so that a command line is read without its prompt. It
+    # runs last: a prompt the user's PROMPT_COMMAND sets anew gets it too.
+    __kt_prompt_end() {
+        local ec=$?
+        if [ -z "$KEEPTERM_INTEGRATION" ] && [[ $PS1 != *'133;B'* ]]; then PS1+='\[\e]133;B\e\\\]'; fi
+        return $ec
+    }
     if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
-        PROMPT_COMMAND=(__kt_precmd "${PROMPT_COMMAND[@]}")
+        PROMPT_COMMAND=(__kt_precmd "${PROMPT_COMMAND[@]}" __kt_prompt_end)
     else
-        PROMPT_COMMAND="__kt_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+        PROMPT_COMMAND="__kt_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}; __kt_prompt_end"
     fi
 fi
 )KT";
@@ -155,8 +162,15 @@ if [[ $KEEPTERM_SHELL_INTEGRATION != 0 && -z $__kt_loaded ]]; then
         return $ec
     }
     __kt_preexec() { [[ -z $KEEPTERM_INTEGRATION ]] && __kt_emit $'\e]133;C\e\\' }
+    # The end of the prompt (OSC 133 B), so that a command line is read without its prompt. It
+    # runs last: a theme that sets the prompt anew in its precmd gets it too.
+    __kt_prompt_end() {
+        local ec=$?
+        [[ -z $KEEPTERM_INTEGRATION && $PS1 != *$'\e]133;B'* ]] && PS1+=$'%{\e]133;B\e\\%}'
+        return $ec
+    }
     typeset -ga precmd_functions preexec_functions
-    precmd_functions=(__kt_precmd $precmd_functions)
+    precmd_functions=(__kt_precmd $precmd_functions __kt_prompt_end)
     preexec_functions+=(__kt_preexec)
 fi
 if [[ -o login ]]; then ZDOTDIR=$__kt_zdir; else __kt_restore_zdotdir; fi
@@ -191,6 +205,14 @@ if test "$KEEPTERM_SHELL_INTEGRATION" != 0; and not set -q __kt_loaded
     end
     function __kt_postexec --on-event fish_postexec
         __kt_emit (printf '\e]133;D;%s\e\\' $status)
+    end
+    # The end of the prompt (OSC 133 B), so that a command line is read without its prompt.
+    if test -z "$KEEPTERM_INTEGRATION"; and functions -q fish_prompt
+        functions -c fish_prompt __kt_user_prompt
+        function fish_prompt
+            __kt_user_prompt
+            printf '\e]133;B\e\\'
+        end
     end
 end
 )KT";

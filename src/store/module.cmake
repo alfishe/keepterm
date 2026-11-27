@@ -118,6 +118,9 @@ endif()
 target_link_libraries(keepterm PRIVATE kt_store)
 target_compile_definitions(keepterm PRIVATE KT_HAVE_STORE=1)
 # The session host writes the warm store on its storage thread (session/history_writer.h).
-target_sources(kt_session PRIVATE session/history_writer.cpp)
+target_sources(kt_session PRIVATE session/history_writer.cpp session/history_catchup.cpp session/archive.cpp
+                                  session/history_index.cpp session/history_cli.cpp session/history_retention.cpp
+                                  session/history_output.cpp session/history_events.cpp
+                                  session/history_export.cpp)
 target_link_libraries(kt_session PRIVATE kt_store)
 target_compile_definitions(kt_session PRIVATE KT_HAVE_STORE=1)

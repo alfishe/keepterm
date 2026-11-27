@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
+#include <map>
 #include <system_error>
 #include <utility>
 
+#include "base/utf8_range.h"
 #include "platform/paths.h"
 
 namespace kt::commands::palette {
@@ -481,6 +485,191 @@ public:
     }
 };
 
+// The History scope: every session of the history, last used first. Enter is the main action
+// (Show, Attach, Restore); Alt shows the session in the Session History window.
+std::string ago(std::int64_t ms, std::int64_t now) {
+    const std::int64_t sec = now > ms ? (now - ms) / 1000 : 0;
+    if (sec < 60) return "now";
+    if (sec < 3600) return std::to_string(sec / 60) + "m ago";
+    if (sec < 48 * 3600) return std::to_string(sec / 3600) + "h ago";
+    const std::int64_t d = sec / 86400;
+    if (d < 14) return std::to_string(d) + "d ago";
+    if (d < 60) return std::to_string(d / 7) + "w ago";
+    return std::to_string(d / 30) + "mo ago";
+}
+
+// "webapp · Claude Code, Qoder CLI · #flaky · closed 2d ago": what a history row needs to be told
+// apart from the others.
+std::string history_context(const HistoryInfo& h, std::int64_t now) {
+    std::vector<std::string> parts;
+    if (!h.project.empty()) parts.push_back(h.project);
+    const auto& agents = h.agent_names.empty() ? h.agents : h.agent_names;
+    std::vector<std::string> seen;
+    for (const auto& a : agents)
+        if (std::find(seen.begin(), seen.end(), a) == seen.end()) seen.push_back(a);
+    if (!seen.empty()) {
+        std::string s;
+        for (const auto& a : seen) s += (s.empty() ? "" : ", ") + a;
+        parts.push_back(s);
+    }
+    if (!h.tags.empty()) {
+        std::string s;
+        for (const auto& t : h.tags) s += (s.empty() ? "#" : " #") + t;
+        parts.push_back(s);
+    }
+    std::string state;
+    switch (h.state) {
+        case HistoryInfo::State::Live: state = "live"; break;
+        case HistoryInfo::State::Background: state = "running, no tab"; break;
+        case HistoryInfo::State::Closed: state = "closed " + ago(h.ended_ms ? h.ended_ms : h.last_used_ms, now); break;
+    }
+    if (h.state != HistoryInfo::State::Closed && h.last_used_ms) state += ", used " + ago(h.last_used_ms, now);
+    if (h.pinned) state += ", pinned";
+    parts.push_back(state);
+    std::string out;
+    for (const auto& p : parts) out += (out.empty() ? "" : " \xC2\xB7 ") + p;
+    return out;
+}
+
+std::string history_name(const HistoryInfo& h) { return h.title.empty() ? (h.cwd.empty() ? h.id : h.cwd) : h.title; }
+
+// "14:05" in local time.
+std::string clock_of(std::int64_t ms) {
+    const auto t = static_cast<std::time_t>(ms / 1000);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[8];
+    std::snprintf(buf, sizeof buf, "%02d:%02d", tm.tm_hour, tm.tm_min);
+    return buf;
+}
+
+char fold_ascii(char ch) { return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch; }
+
+class HistorySource final : public Source {
+public:
+    std::string_view id() const override { return "history"; }
+    bool serves(PaletteScope s, QueryMode m) const override { return s == PaletteScope::History && m == QueryMode::All; }
+    void collect(const Query&, const SourceContext& c, std::vector<Item>& out) override {
+        if (!c.data || !c.data->history) return;
+        ICommandTarget* t = c.target ? c.target : &fallback_target();
+        auto all = c.data->history();
+        std::stable_sort(all.begin(), all.end(), [](const HistoryInfo& a, const HistoryInfo& b) { return a.last_used_ms > b.last_used_ms; });
+        for (const auto& h : all) {
+            Item it;
+            it.key = "his:" + h.id;
+            it.title = history_name(h);
+            it.subtitle = history_context(h, c.now_ms);
+            it.aliases.push_back(h.project);
+            it.aliases.push_back(h.cwd);
+            for (const auto& a : h.agents) it.aliases.push_back(a);
+            for (const auto& a : h.agent_names) it.aliases.push_back(a);
+            for (const auto& g : h.tags) it.aliases.push_back(g);
+            it.category = "History";
+            it.icon = h.agents.empty() ? "terminal" : "agent";
+            const std::string id = h.id;
+            it.run = [t, id] { (void)t->open_history_session(id); };
+            it.alt = AltAction{"Show in Session History", [t, id] { (void)t->reveal_in_history(id); }};
+            out.push_back(std::move(it));
+        }
+    }
+};
+
+// The History scope's "In output" section: lines of stored output with the typed text, grouped by
+// session (its newest lines first, at most kPerSession, then a "+N more" row). Each row names its
+// session as the History rows do; the line is a second line with the match marked. The search runs
+// off the UI thread; until it answers, one disabled row says so.
+class HistoryOutputSource final : public Source {
+public:
+    static constexpr std::size_t kMinQuery = 3, kPerSession = 3;
+    std::string_view id() const override { return "history_output"; }
+    bool serves(PaletteScope s, QueryMode m) const override { return s == PaletteScope::History && m == QueryMode::All; }
+    bool query_dependent() const override { return true; }
+    void collect(const Query& q, const SourceContext& c, std::vector<Item>& out) override {
+        if (!c.data || !c.data->history_search || q.text.size() < kMinQuery) return;
+        ICommandTarget* t = c.target ? c.target : &fallback_target();
+        const std::vector<OutputHit>* hits = c.data->history_search->hits(q.text);
+        if (!hits) {
+            Item it;
+            it.key = "out:searching";
+            it.category = "In output";
+            it.title = "Searching the stored output\xE2\x80\xA6";
+            it.enabled = false;
+            it.icon = "search";
+            out.push_back(std::move(it));
+            return;
+        }
+        std::map<std::string, HistoryInfo> infos;
+        if (c.data->history)
+            for (auto& h : c.data->history()) infos.emplace(h.id, std::move(h));
+        // Sessions in the order of their newest hit.
+        std::vector<std::string> order;
+        std::map<std::string, std::vector<const OutputHit*>> by;
+        for (const auto& h : *hits) {
+            auto& v = by[h.history_id];
+            if (v.empty()) order.push_back(h.history_id);
+            v.push_back(&h);
+        }
+        std::string needle;
+        for (char ch : q.text) needle += fold_ascii(ch);
+        while (!needle.empty() && needle.back() == ' ') needle.pop_back();
+        for (const auto& id : order) {
+            const auto& lines = by[id];
+            HistoryInfo info;
+            if (auto f = infos.find(id); f != infos.end()) info = f->second;
+            else {
+                info.id = id;
+                info.title = lines.front()->title;
+                info.project = lines.front()->project;
+            }
+            const std::string name = history_name(info), context = history_context(info, c.now_ms);
+            const std::string_view icon = info.agents.empty() ? "terminal" : "agent";
+            for (std::size_t i = 0; i < lines.size() && i < kPerSession; ++i) {
+                const OutputHit& h = *lines[i];
+                Item it;
+                it.key = "out:" + id + ":" + std::to_string(h.ts_ms) + ":" + std::to_string(i);
+                it.title = name;
+                it.subtitle = context;
+                // The line: its time, then the text without its indent, the match marked.
+                std::string text = h.text;
+                std::size_t cut = text.find_first_not_of(" \t");
+                if (cut == std::string::npos) cut = text.size();
+                text = text.substr(cut);
+                const std::string prefix = clock_of(h.ts_ms) + "  ";
+                it.detail = prefix + text;
+                std::string folded;
+                for (char ch : text) folded += fold_ascii(ch);
+                for (std::size_t at = needle.empty() ? std::string::npos : folded.find(needle); at != std::string::npos;
+                     at = folded.find(needle, at + needle.size()))
+                    it.detail_marks.emplace_back(prefix.size() + at, needle.size());
+                if (it.detail_marks.empty() && h.match_offset >= cut)
+                    if (auto r = utf8_whole_range(text, h.match_offset - cut, h.match_len))
+                        it.detail_marks.emplace_back(prefix.size() + r->first, r->second);
+                it.category = "In output";
+                it.icon = icon;
+                const std::string query = q.text;
+                it.run = [t, id, query, line = HistoryLine{h.seq, h.text}] { (void)t->open_history_output(id, query, line); };
+                it.alt = AltAction{"Show in Session History", [t, id] { (void)t->reveal_in_history(id); }};
+                out.push_back(std::move(it));
+            }
+            if (lines.size() > kPerSession) {
+                Item more;
+                more.key = "out:" + id + ":more";
+                const std::size_t n = lines.size() - kPerSession;
+                more.title = "+" + std::to_string(n) + (n == 1 ? " more line in " : " more lines in ") + name;
+                more.subtitle = "Session History";
+                more.category = "In output";
+                more.icon = "history";
+                more.run = [t, id] { (void)t->reveal_in_history(id); };
+                out.push_back(std::move(more));
+            }
+        }
+    }
+};
+
 }  // namespace
 
 std::unique_ptr<Source> make_command_source() { return std::make_unique<CommandSource>(); }
@@ -490,6 +679,8 @@ std::unique_ptr<Source> make_folder_source() { return std::make_unique<FolderSou
 std::unique_ptr<Source> make_session_source() { return std::make_unique<SessionSource>(); }
 std::unique_ptr<Source> make_workspace_source() { return std::make_unique<WorkspaceSource>(); }
 std::unique_ptr<Source> make_path_source() { return std::make_unique<PathSource>(); }
+std::unique_ptr<Source> make_history_source() { return std::make_unique<HistorySource>(); }
+std::unique_ptr<Source> make_history_output_source() { return std::make_unique<HistoryOutputSource>(); }
 
 std::vector<std::unique_ptr<Source>> make_builtin_sources(std::span<const std::string> enabled) {
     std::vector<std::unique_ptr<Source>> all;
@@ -500,10 +691,14 @@ std::vector<std::unique_ptr<Source>> make_builtin_sources(std::span<const std::s
     all.push_back(make_session_source());
     all.push_back(make_workspace_source());
     all.push_back(make_path_source());
+    all.push_back(make_history_source());
+    all.push_back(make_history_output_source());
     if (enabled.empty()) return all;
+    // Path mode and the History scope answer only when asked for: palette.sources does not hide them.
     std::vector<std::unique_ptr<Source>> out;
     for (auto& s : all)
-        if (std::find(enabled.begin(), enabled.end(), s->id()) != enabled.end() || s->id() == "path")
+        if (std::find(enabled.begin(), enabled.end(), s->id()) != enabled.end() || s->id() == "path" || s->id() == "history" ||
+            s->id() == "history_output")
             out.push_back(std::move(s));
     return out;
 }
@@ -713,6 +908,22 @@ const Result& Engine::search(std::string_view raw, std::size_t limit) {
         sec.rows.push_back(std::move(r));
     }
     if (!sec.rows.empty()) result_.sections.push_back(std::move(sec));
+    // Sources that answer per query (the History scope's output search) follow as their own
+    // section, in their own order.
+    path_items_.clear();
+    std::vector<std::uint16_t> src_of;
+    for (std::size_t s = 0; s < sources_.size(); ++s) {
+        if (!sources_[s]->query_dependent() || !sources_[s]->serves(q.scope, q.mode)) continue;
+        sources_[s]->collect(q, ctx_, path_items_);
+        src_of.resize(path_items_.size(), static_cast<std::uint16_t>(s));
+    }
+    if (!path_items_.empty()) {
+        Section extra;
+        extra.header = path_items_.front().category;
+        for (std::size_t i = 0; i < path_items_.size(); ++i) extra.rows.push_back(Row{&path_items_[i], 0, {}, src_of[i]});
+        result_.matched += path_items_.size();
+        result_.sections.push_back(std::move(extra));
+    }
     last_query_ = std::move(q);
     return result_;
 }

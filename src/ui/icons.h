@@ -14,7 +14,7 @@ enum class Icon : uint8_t {
     none,
     folder, terminal, plus, close, chevron_right, chevron_down, sidebar, split_right, split_down,
     zoom, unzoom, memory, cpu, gear, search, dot, agent, spinner, check, alert, storage, bell, pin,
-    more, copy, menu, minimize, maximize, palette, trash, edit, keyboard, info,
+    more, copy, menu, minimize, maximize, palette, trash, edit, keyboard, info, history,
     count_,
 };
 

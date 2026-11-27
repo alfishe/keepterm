@@ -68,6 +68,7 @@ std::string_view scope_name(PaletteScope s) {
         case PaletteScope::Folders: return "folders";
         case PaletteScope::MoveTabToProject: return "move_tab_to_project";
         case PaletteScope::Workspaces: return "workspaces";
+        case PaletteScope::History: return "history";
     }
     return "root";
 }

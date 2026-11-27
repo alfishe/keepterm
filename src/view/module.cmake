@@ -5,7 +5,7 @@ kt_module(kt_view
     ${CMAKE_CURRENT_LIST_DIR}/terminal/atlas_textures.cpp
     ${CMAKE_CURRENT_LIST_DIR}/terminal/terminal_view.cpp
     ${CMAKE_CURRENT_LIST_DIR}/terminal/text_ops.cpp)
-target_link_libraries(kt_view PUBLIC kt_vt kt_text kt_render)
+target_link_libraries(kt_view PUBLIC kt_vt kt_text kt_render PRIVATE kt_pcre2)
 set_target_properties(kt_view PROPERTIES KT_CORE ON)
 
 # Headless rendering of the app (`keepterm --pty-render`).

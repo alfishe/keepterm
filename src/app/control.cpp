@@ -191,6 +191,8 @@ void Server::serve(session::ipc::Stream& s) {
     mc.commands = info_.commands;
     mc.default_pane = h.str_or("pane");
     mc.handle = [this](const json::Value& req) { return handle_(req); };
+    // Under the frame limit (4 MiB) with room for the JSON-RPC envelope.
+    mc.run_local = [](const std::vector<std::string>& args, int timeout_ms) { return run_self(args, timeout_ms, 3u << 20); };
     while (!stopping_) {
         auto f = read_frame(s, pending, -1);
         if (!f || f->type == FrameType::Bye) return;

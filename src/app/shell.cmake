@@ -33,3 +33,5 @@ endif()
 
 # Settings (src/app/settings.cmake).
 include(${CMAKE_CURRENT_LIST_DIR}/settings.cmake)
+# Session History (src/app/history.cmake).
+include(${CMAKE_CURRENT_LIST_DIR}/history.cmake)

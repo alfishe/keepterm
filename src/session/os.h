@@ -92,16 +92,22 @@ std::string self_exe();
 // program); "{ready}" in it is replaced by the inherited ready fd or handle value. Waits up to
 // `timeout` for the child's ready line and returns it ("OK <pid>" or "ERR ..."). Without
 // "{ready}" in `args` it starts a plain background process and returns at once.
+// The spawner alone decides whether the child is taken: a child that reported ready but was not
+// taken in time ends (POSIX: the spawner acknowledges the line it takes and closes the channel
+// unacknowledged on a timeout; Windows: the spawner ends the child on a timeout). A child written
+// off never lives on unseen. `before_wait` (tests) runs once the child is started, before the
+// spawner reads the channel.
 struct Spawned {
     uint32_t pid = 0;
     std::string ready_line;
     bool may_end_with_gui = false;   // Windows: inside a job that forbids breakaway
 };
-Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono::milliseconds timeout);
+Result<Spawned> spawn_detached(const std::vector<std::string>& args, std::chrono::milliseconds timeout,
+                               const std::function<void()>& before_wait = {});
 
 // Host side of the ready channel: writes `line` + "\n" and closes the handle. Idempotent.
-// False when the line could not be written: the spawner gave up waiting (timeout) and nobody
-// will use this host.
+// False when the spawner did not take the line: it gave up waiting (timeout) and nobody will use
+// this host. POSIX: waits for the spawner's acknowledgement (two minutes at most).
 bool signal_ready(int64_t handle, std::string_view line);
 
 // Host process setup: no console, stdio to the null device (or to KEEPTERM_HOST_LOG), umask
@@ -121,5 +127,36 @@ void release_free_memory();
 void watch_shutdown(std::function<void(bool final)> cb);
 
 std::string getenv_utf8(const char* name);
+
+// Anonymous read-write memory straight from the OS, outside the heap: a page costs memory only
+// once it is written, so a buffer sized for the worst case costs what is used. One mapping for
+// the buffer's lifetime: no reallocation, no heap fragmentation. Move-only.
+class LazyPages {
+public:
+    LazyPages() = default;
+    explicit LazyPages(std::size_t bytes);  // rounded up to whole pages; throws std::bad_alloc
+    LazyPages(LazyPages&& o) noexcept : p_(o.p_), n_(o.n_) {
+        o.p_ = nullptr;
+        o.n_ = 0;
+    }
+    LazyPages& operator=(LazyPages&& o) noexcept;
+    LazyPages(const LazyPages&) = delete;
+    LazyPages& operator=(const LazyPages&) = delete;
+    ~LazyPages();
+
+    std::byte* data() const { return p_; }
+    std::size_t size() const { return n_; }
+    // Gives the whole pages inside [off, off + len) back to the OS; their contents are lost
+    // (POSIX: they read as zero, Windows: undefined) and the next write takes a fresh page.
+    void discard(std::size_t off, std::size_t len);
+    // Bytes of the buffer in physical memory now (mincore, QueryWorkingSetEx); for tests.
+    std::size_t resident_bytes() const;
+
+    static std::size_t page_size();
+
+private:
+    std::byte* p_ = nullptr;
+    std::size_t n_ = 0;
+};
 
 }  // namespace kt::session::os

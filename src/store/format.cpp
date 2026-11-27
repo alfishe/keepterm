@@ -223,6 +223,7 @@ bool decode_records(std::string_view raw, uint64_t first_seq, uint64_t ts_first,
         uint64_t len = 0, ds = 0, dt = 0;
         if (!get_varint(p, end, len) || !get_varint(p, end, ds) || !get_varint(p, end, dt)) return false;
         if (len > static_cast<uint64_t>(end - p)) return false;
+        if (ds > UINT64_MAX - first_seq || dt > UINT64_MAX - ts_first) return false;  // would wrap around
         out.push_back({first_seq + ds, ts_first + dt, std::string_view(p, static_cast<std::size_t>(len))});
         p += len;
     }

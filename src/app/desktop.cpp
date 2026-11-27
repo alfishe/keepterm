@@ -134,6 +134,50 @@ bool pick_folder(void* native_view, const std::string& title, const std::string&
     return true;
 }
 
+bool pick_save_file(void* native_view, const std::string& title, const std::string& folder, const std::string& name,
+                    std::function<void(std::string)> done, const Post&) {
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool uninit = SUCCEEDED(init);
+    IFileSaveDialog* dlg = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+    if (FAILED(hr) || !dlg) {
+        if (uninit) CoUninitialize();
+        return false;
+    }
+    DWORD flags = 0;
+    if (SUCCEEDED(dlg->GetOptions(&flags))) dlg->SetOptions(flags | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST);
+    if (!title.empty()) dlg->SetTitle(wide(title).c_str());
+    if (!name.empty()) dlg->SetFileName(wide(name).c_str());
+    if (!folder.empty()) {
+        std::wstring wf = wide(folder);
+        for (wchar_t& c : wf) {
+            if (c == L'/') c = L'\\';   // the shell parses native separators only
+        }
+        IShellItem* start = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(wf.c_str(), nullptr, IID_PPV_ARGS(&start))) && start) {
+            dlg->SetFolder(start);
+            start->Release();
+        }
+    }
+    HWND owner = native_view ? GetAncestor(static_cast<HWND>(native_view), GA_ROOT) : nullptr;
+    std::string chosen;
+    if (SUCCEEDED(dlg->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                chosen = narrow(path);
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    if (uninit) CoUninitialize();
+    if (!chosen.empty()) done(chosen);
+    return true;
+}
+
 #elif !defined(__APPLE__)
 
 namespace {
@@ -232,6 +276,25 @@ bool pick_folder(void*, const std::string& title, const std::string& initial, st
         if (!initial.empty()) argv.push_back("--filename=" + initial + (initial.back() == '/' ? "" : "/"));
     } else if (std::string k = find_on_path({"kdialog"}); !k.empty()) {
         argv = {k, "--title", title, "--getexistingdirectory", initial.empty() ? std::string(".") : initial};
+    } else {
+        return false;
+    }
+    if (!post) return false;
+    std::thread([argv = std::move(argv), done = std::move(done), post] {
+        std::string chosen = capture_output(argv);
+        if (!chosen.empty()) post([done, chosen] { done(chosen); });
+    }).detach();
+    return true;
+}
+
+bool pick_save_file(void*, const std::string& title, const std::string& folder, const std::string& name,
+                    std::function<void(std::string)> done, const Post& post) {
+    std::string start = folder.empty() ? name : folder + (folder.back() == '/' ? "" : "/") + name;
+    std::vector<std::string> argv;
+    if (std::string z = find_on_path({"zenity"}); !z.empty()) {
+        argv = {z, "--file-selection", "--save", "--confirm-overwrite", "--title=" + title, "--filename=" + start};
+    } else if (std::string k = find_on_path({"kdialog"}); !k.empty()) {
+        argv = {k, "--title", title, "--getsavefilename", start};
     } else {
         return false;
     }

@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <future>
 #include <thread>
@@ -43,7 +44,10 @@
 #include "render/render_select.h"
 #include "resources/collector.h"
 #include "session/agent_statusline.h"
+#include "session/archive.h"
 #include "session/client.h"
+#include "session/history_index.h"
+#include "session/spawn.h"
 #include "session/proc_chain.h"
 #include "session/os.h"
 #include "session/registry.h"
@@ -65,6 +69,8 @@
 #include "ui/text_service.h"
 #include "ui/window.h"
 #include "ui/workspace_widgets.h"
+#include "app/history_controller.h"
+#include "app/output_viewer.h"
 #include "app/settings_controller.h"
 #include "app/settings_open.h"
 #include "app/limits_refresher.h"
@@ -146,6 +152,100 @@ struct MonitorReport {
     ui::Resources total;                         // the GUI plus every session
     std::optional<ui::StorageUsage> storage;
 };
+
+#ifdef KT_HAVE_SESSIONS
+// The output search of the palette's History scope: one search at a time off the UI thread; a
+// new query cancels the running one. The result goes back on the UI thread, then `ready` runs.
+class HistoryOutputSearch final : public commands::palette::IHistorySearch {
+public:
+    using Post = std::function<void(std::function<void()>)>;
+    HistoryOutputSearch(Post post, std::function<void()> ready) : post_(std::move(post)), ready_(std::move(ready)) {}
+    ~HistoryOutputSearch() override {
+        *alive_ = false;
+        stop();
+    }
+    const std::vector<commands::palette::OutputHit>* hits(std::string_view q) override {
+        if (have_ && q == done_query_) return &done_;
+        if (q != running_query_) start(std::string(q));
+        return nullptr;
+    }
+
+private:
+    void stop() {
+        if (!th_.joinable()) return;
+        cancel_->store(true);
+        th_.join();
+    }
+    void start(std::string q) {
+        stop();
+        running_query_ = q;
+        cancel_ = std::make_shared<std::atomic<bool>>(false);
+        th_ = std::thread([this, q, cancel = cancel_, alive = std::weak_ptr<bool>(alive_)] {
+            std::vector<commands::palette::OutputHit> hits;
+            if (auto p = session::os::paths()) {
+                for (auto& h : session::search_history_output(*p, q, 200, cancel.get()))
+                    hits.push_back({std::move(h.id), std::move(h.title), std::move(h.project), std::move(h.text),
+                                    static_cast<std::int64_t>(h.ts_ms), h.match_offset, h.match_len, h.seq});
+            }
+            if (cancel->load()) return;
+            post_([this, q, hits = std::move(hits), cancel, alive]() mutable {
+                if (alive.expired() || !*alive.lock() || cancel->load()) return;
+                done_query_ = q;
+                done_ = std::move(hits);
+                have_ = true;
+                running_query_.clear();
+                if (ready_) ready_();
+            });
+        });
+    }
+
+    Post post_;
+    std::function<void()> ready_;
+    std::thread th_;
+    std::shared_ptr<std::atomic<bool>> cancel_ = std::make_shared<std::atomic<bool>>(false);
+    std::string running_query_, done_query_;
+    std::vector<commands::palette::OutputHit> done_;
+    bool have_ = false;
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+};
+#endif
+
+#ifdef KT_HAVE_SESSIONS
+// The Session History window's output search: one worker, a new text cancels the running one;
+// the result goes back to the UI thread grouped by session.
+class HistoryWindowSearch {
+public:
+    using Post = std::function<void(std::function<void()>)>;
+    explicit HistoryWindowSearch(Post post) : post_(std::move(post)) {}
+    ~HistoryWindowSearch() { stop(); }
+    void start(std::string text, std::function<void(history::OutputMatches)> done) {
+        stop();
+        cancel_ = std::make_shared<std::atomic<bool>>(false);
+        th_ = std::thread([this, text = std::move(text), done = std::move(done), cancel = cancel_] {
+            history::OutputMatches m;
+            if (auto p = session::os::paths()) {
+                for (auto& h : session::search_history_output(*p, text, kLimit, cancel.get()))
+                    m[h.id].push_back({std::move(h.text), h.ts_ms, h.match_offset, h.match_len, h.seq});
+            }
+            if (cancel->load()) return;
+            post_([m = std::move(m), done, cancel]() mutable {
+                if (!cancel->load()) done(std::move(m));
+            });
+        });
+    }
+
+private:
+    static constexpr std::size_t kLimit = 500;
+    void stop() {
+        if (!th_.joinable()) return;
+        cancel_->store(true);
+        th_.join();
+    }
+    Post post_;
+    std::thread th_;
+    std::shared_ptr<std::atomic<bool>> cancel_ = std::make_shared<std::atomic<bool>>(false);
+};
+#endif
 
 // OS-native process start time (resources::ProcessKey units) to Unix milliseconds; 0 = unknown.
 uint64_t start_unix_ms(uint64_t native) {
@@ -255,6 +355,12 @@ public:
         std::lock_guard lk(mu_);
         sessions_ = std::move(s);
     }
+    // The session ids every pane of the workspace claims, all windows (UI thread of the owner
+    // window): session folders outside it are archived by the sweep.
+    void set_claimed(std::vector<std::string> c) {
+        std::lock_guard lk(mu_);
+        claimed_ = std::move(c);
+    }
 
 private:
     static std::string agent_of_chain(const std::vector<session::proto::ChainEntry>& chain) { return app::agent_of_chain(chain); }
@@ -263,6 +369,7 @@ private:
         int tick = 0;
         for (;;) {
             std::vector<std::pair<std::string, std::string>> sessions;
+            std::optional<std::vector<std::string>> claimed;
             bool discover = false;
             {
                 std::unique_lock lk(mu_);
@@ -270,6 +377,7 @@ private:
                 if (stop_) return;
                 poke_ = false;
                 sessions = sessions_;
+                claimed = claimed_;
                 discover = discover_ || tick % kDiscoverEvery == 0;
                 discover_ = false;
             }
@@ -300,6 +408,7 @@ private:
                 for (const auto& e : pi->foreground_chain) cf.chain[e.pid] = e;
             }
             if (discover) rep.detached = detached(sessions);
+            if (discover && claimed) sweep(*claimed);
 #endif
             collector_->set_sessions(std::move(infos));
             if (auto snap = collector_->tick(); snap && *snap && !(*snap)->machines.empty()) {
@@ -329,6 +438,34 @@ private:
     }
 
 #ifdef KT_HAVE_SESSIONS
+    // Archives the session folders no pane claims and no host holds: panes closed
+    // while their host was dead, hosts killed before they archived, projects removed. A folder
+    // must be unclaimed in two rounds in a row and unchanged for 30 s, so a host that is just
+    // being spawned or restored is never taken (it holds the folder's lock anyway).
+    void sweep(const std::vector<std::string>& claimed) {
+        auto paths = session::os::paths();
+        if (!paths) return;
+        std::set<std::string> now_unclaimed;
+        for (const std::string& name : session::os::list_dir(paths->state_sessions)) {
+            if (!session::SessionId::parse(name)) continue;
+            if (std::find(claimed.begin(), claimed.end(), name) != claimed.end()) continue;
+            const std::string dir = session::os::join(paths->state_sessions, name);
+            std::error_code ec;
+            const auto mtime = std::filesystem::last_write_time(platform::paths::from_utf8(dir), ec);
+            if (ec || std::filesystem::file_time_type::clock::now() - mtime < std::chrono::seconds(30)) continue;
+            now_unclaimed.insert(name);
+            if (!unclaimed_.count(name)) continue;
+            session::ArchiveOptions ao;
+            ao.state = paths->state;
+            ao.close_reason = "orphaned";
+            auto r = session::archive_session(dir, ao);
+            if (!r) log::warn("history", "sweep of " + name + ": " + r.error().what);
+            else if (r->outcome != session::ArchiveOutcome::busy)
+                log::info("history", "sweep: " + name + " " + std::string(session::to_string(r->outcome)));
+        }
+        unclaimed_ = std::move(now_unclaimed);
+    }
+
     // The live hosts of this profile minus the watched ones, with what runs in them.
     static std::vector<DetachedSession> detached(const std::vector<std::pair<std::string, std::string>>& watched) {
         std::vector<DetachedSession> out;
@@ -379,10 +516,7 @@ private:
             u.label = "History unavailable";
             return u;
         }
-        u.valid = true;
-        u.used = r->total.used;
-        u.limit = r->total.limit;
-        return u;
+        return ui::storage_usage(r->total.used, r->total.limit);
     }
 
     Post post_;
@@ -390,6 +524,8 @@ private:
     std::filesystem::path store_root_;
     store::Policy policy_;
     std::unique_ptr<store::Catalog> catalog_;
+    std::optional<std::vector<std::string>> claimed_;   // under mu_
+    std::set<std::string> unclaimed_;                   // monitor thread: the last sweep's
     std::unique_ptr<resources::Collector> collector_;
     std::mutex mu_;
     std::condition_variable cv_;
@@ -785,12 +921,18 @@ public:
         ps->select_all();
         return {};
     }
-    cmd::Status open_find() override {
+    cmd::Status open_find() override { return open_find_with({}); }
+    // The find bar on the focused pane; `initial` searches at once (the palette's History scope).
+    cmd::Status open_find_with(std::string initial) {
         PaneSession* ps = focused_pane();
         const auto id = focused_id();
         if (!ps || !id || !uiw_) return no("find");
         if (ui::Widget* w = find_bar_ ? uiw_->overlay(find_bar_) : nullptr) {
             auto* bar = dynamic_cast<ui::FindBar*>(w);
+            if (bar && !initial.empty()) {
+                bar->field().set_text(initial);
+                if (bar->field().on_change) bar->field().on_change(initial);
+            }
             if (bar) uiw_->set_focus(&bar->field(), true);
             return {};
         }
@@ -801,17 +943,18 @@ public:
         }
         const ui::PaneKey key = WorkspaceAdapter::key(*id);
         ui::FindBarHooks h;
-        h.query = [this, key](const std::string& q) -> std::pair<size_t, std::optional<size_t>> {
+        h.query = [this, key](const std::string& q, bool regex) -> ui::FindResult {
+            find_regex_ = regex;   // the next bar starts the same way
             auto it = panes_.find(key);
-            if (it == panes_.end()) return {0, std::nullopt};
-            const size_t n = it->second->find(q);
-            return {n, it->second->find_current()};
+            if (it == panes_.end()) return {};
+            const size_t n = it->second->find(q, regex);
+            return {n, it->second->find_current(), it->second->find_error(), it->second->find_partial()};
         };
-        h.step = [this, key](int d) -> std::pair<size_t, std::optional<size_t>> {
+        h.step = [this, key](int d) -> ui::FindResult {
             auto it = panes_.find(key);
-            if (it == panes_.end()) return {0, std::nullopt};
+            if (it == panes_.end()) return {};
             it->second->find_step(d);
-            return {it->second->find_count(), it->second->find_current()};
+            return {it->second->find_count(), it->second->find_current(), it->second->find_error(), it->second->find_partial()};
         };
         h.closed = [this, key] {
             if (auto it = panes_.find(key); it != panes_.end()) it->second->end_find();
@@ -821,7 +964,7 @@ public:
                 if (mv_) mv_->focus_active_pane();
             });
         };
-        find_bar_ = ui::show_find_bar(*uiw_, std::move(h), {r.x, r.y}, last_query_for(ps));
+        find_bar_ = ui::show_find_bar(*uiw_, std::move(h), {r.x, r.y}, initial.empty() ? last_query_for(ps) : initial, find_regex_);
         return {};
     }
     cmd::Status find_step(int delta) override {
@@ -1148,6 +1291,24 @@ public:
             rs.id = "restart_no_resume";
             items.push_back(rs);
         }
+#ifdef KT_HAVE_SESSIONS
+        // The pane's entry in Session History: the series its session belongs to.
+        if (const ws::Pane* wp = pane_of_key(k)) {
+            ui::MenuItem sh;
+            sh.label = std::string(ui::tr("Show in Session History"));
+            sh.id = "show_in_history";
+            sh.action = [this, sid = wp->session.str()] {
+                for (const auto& it : history_items()) {
+                    if (it.e.session != sid && it.e.id != sid) continue;
+                    if (auto st = reveal_in_history(it.e.id); !st) toast(std::string(ui::tr("Session History")), st.error().what);
+                    return;
+                }
+                toast(std::string(ui::tr("Not in Session History")),
+                      std::string(ui::tr("Private panes and panes with history off are not recorded")));
+            };
+            items.push_back(std::move(sh));
+        }
+#endif
         if (full) {
             if (saved || !pi->agent.empty()) items.push_back(ui::MenuItem::sep());
             else {
@@ -2605,6 +2766,13 @@ public:
                                   : std::string();
         d.body = std::move(body);
         d.width = 560;
+#ifdef KT_HAVE_SESSIONS
+        d.buttons.push_back({std::string(ui::tr("Session History\xE2\x80\xA6")), [this] {
+                                 sessions_dialog_ = 0;
+                                 post_alive([this] { (void)show_session_history(); });
+                             },
+                             ui::Button::Kind::secondary, false, false});
+#endif
         d.buttons.push_back({std::string(ui::tr("Close")), [this] { sessions_dialog_ = 0; }, ui::Button::Kind::secondary, true, true});
         sessions_dialog_ = ui::show_dialog(*uiw_, std::move(d));
     }
@@ -3183,6 +3351,58 @@ public:
             if (auto r = open_with_default_app(file); !r) toast("Cannot open the config file", r.error().what);
         };
 #ifdef KT_HAVE_SESSIONS
+        // Settings → History: the sessions of the history.
+        env.history_summary = []() -> Result<HistorySummary> {
+            auto p = session::os::paths();
+            if (!p) return Unexpected(p.error());
+            HistorySummary h;
+            for (const auto& e : session::list_history(*p)) {
+                ++h.sessions;
+                if (e.state == session::HistoryState::closed) ++h.closed;
+                if (e.pinned) ++h.pinned;
+                h.raw_bytes += e.stats.raw_bytes;
+                h.stored_bytes += e.stats.stored_bytes;
+            }
+            return h;
+        };
+        env.history_due = [this](std::int64_t keep_closed_ms) {
+            HistoryDeletion d;
+            auto p = session::os::paths();
+            if (!p) return d;
+            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+            const auto r = session::retention_preview(*p, cfg_svc_ ? cfg_svc_->current() : cfg_, static_cast<uint64_t>(now.count()),
+                                                      keep_closed_ms);
+            for (const auto& e : r.due) d.ids.push_back(e.id);
+            d.stored_bytes = r.stored_bytes;
+            return d;
+        };
+        env.history_closed_before = [](std::uint64_t before_ms) {
+            HistoryDeletion d;
+            auto p = session::os::paths();
+            if (!p) return d;
+            for (const auto& e : session::list_history(*p)) {
+                if (e.state != session::HistoryState::closed || e.pinned) continue;
+                const uint64_t end = e.ended_ms ? *e.ended_ms : e.last_used_ms;
+                if (before_ms && end >= before_ms) continue;
+                d.ids.push_back(e.id);
+                d.stored_bytes += e.stats.stored_bytes;
+            }
+            return d;
+        };
+        env.delete_history = [](const std::vector<std::string>& ids) -> Result<void> {
+            auto p = session::os::paths();
+            if (!p) return Unexpected(p.error());
+            size_t failed = 0;
+            std::string first;
+            for (const auto& id : ids) {
+                if (auto r = session::delete_history(*p, id); !r) {
+                    if (!failed++) first = r.error().what;
+                }
+            }
+            if (failed) return make_error(Errc::busy, std::to_string(failed) + " not deleted: " + first);
+            return {};
+        };
+        env.open_session_history = [this] { post_alive([this] { (void)show_session_history(); }); };
         env.statusline_hook = [this] {
             return session::claude_statusline_hook((cfg_svc_ ? cfg_svc_->current() : cfg_).agents_claude_config_dir());
         };
@@ -3218,16 +3438,25 @@ public:
     // the Settings window is the key window, its own chords go there: Close closes it, and Copy,
     // Paste, Select All and Find act on its fields.
     bool route_menu_to_settings(const std::string& id) {
-        if (!settings_win_ || !settings_win_->focused()) return false;
+        UiWindowHost* host = settings_win_ && settings_win_->focused() ? settings_win_.get()
+                             : history_win_ && history_win_->focused() ? history_win_.get()
+                                                                        : nullptr;
+        if (!host) return false;
+        return route_menu_to(*host, id);
+    }
+    bool route_menu_to(UiWindowHost& host, const std::string& id) {
+        UiWindowHost* hp = &host;
         if (id == "pane.close" || id == "tab.close" || id == "window.close") {
-            settings_win_->close();
+            host.close();
             return true;
         }
+        if (host.menu_command(id)) return true;   // Bigger / Smaller / Reset Font: the window's zoom
         if (id == "terminal.paste") {
-            p_.clipboard().read_text(platform::Selection::clipboard, [this, alive = alive_](Result<std::u8string> r) {
-                if (!*alive || !r || r->empty() || !settings_win_) return;
+            p_.clipboard().read_text(platform::Selection::clipboard, [this, hp, alive = alive_](Result<std::u8string> r) {
+                // The window may have closed meanwhile.
+                if (!*alive || !r || r->empty() || (hp != settings_win_.get() && hp != history_win_.get())) return;
                 clipboard_cache_.assign(r->begin(), r->end());
-                if (dynamic_cast<ui::TextField*>(settings_win_->ui().focused())) settings_win_->ui().on_text(as_chars(*r));
+                if (dynamic_cast<ui::TextField*>(hp->ui().focused())) hp->ui().on_text(as_chars(*r));
             });
             return true;
         }
@@ -3241,9 +3470,9 @@ public:
         k.key = key;
         k.logical = ch;
         k.mods = platform::mod_super;
-        settings_win_->ui().on_key(k);
+        host.ui().on_key(k);
         k.action = platform::KeyAction::release;
-        settings_win_->ui().on_key(k);
+        host.ui().on_key(k);
         return true;
     }
 
@@ -3300,6 +3529,476 @@ public:
         settings_win_->ui().set_focus(&raw->sections(), false);
         return true;
     }
+
+    // ------------------------------------------------------------ Session History
+
+    cmd::Status show_session_history() override {
+#ifdef KT_HAVE_SESSIONS
+        if (history_win_) {
+            history_win_->activate();
+            return {};
+        }
+        if (history_sheet_) return {};
+        history_ = std::make_unique<HistoryController>(history_env(), history_state_);
+        if (open_history_window()) return {};
+        // No second window here: a sheet over this one.
+        auto view = history_->make_view();
+        ui::Widget* raw = view.get();
+        const ui::Size ws = uiw_->size();
+        raw->style().width = std::max(480.0f, std::min(1100.0f, ws.w - 32));
+        raw->style().height = std::max(300.0f, std::min(720.0f, ws.h - 32));
+        ui::OverlayOptions o;
+        o.placement = ui::OverlayOptions::Placement::Center;
+        o.anchor = ui::Rect{0, 0, ws.w, ws.h};
+        o.modal = true;
+        o.transient = false;
+        o.dismiss_on_outside_click = false;
+        o.own_keys = true;
+        o.on_close = [this] {
+            history_sheet_ = 0;
+            if (history_) history_state_ = history_->state();
+            if (history_) history_->closed();
+            post_alive([this] {
+                if (history_ && !history_->view()) history_.reset();
+            });
+        };
+        history_->on_close = [this] {
+            post_alive([this] {
+                if (history_sheet_ && uiw_) uiw_->close_overlay(history_sheet_);
+            });
+        };
+        history_sheet_ = uiw_->show_overlay(std::move(view), std::move(o));
+        return {};
+#else
+        return no("session history");
+#endif
+    }
+
+    cmd::Status reveal_in_history(std::string_view id) override {
+#ifdef KT_HAVE_SESSIONS
+        history_state_.selected = std::string(id);
+        if (auto st = show_session_history(); !st) return st;
+        if (history_ && !history_->select(std::string(id))) {
+            // Filtered out: show every session.
+            history_->clear_filters();
+            (void)history_->select(std::string(id));
+        }
+        return {};
+#else
+        (void)id;
+        return no("session history");
+#endif
+    }
+
+    cmd::Status open_history_session(std::string_view id) override {
+#ifdef KT_HAVE_SESSIONS
+        for (const auto& it : history_items()) {
+            if (it.e.id != id) continue;
+            HistoryEnv env = history_env();
+            Result<void> r;
+            switch (it.state) {
+                case history::State::live: r = env.show(it); break;
+                case history::State::background: r = env.attach(it); break;
+                case history::State::closed: r = env.restore(it, std::nullopt, {}); break;
+            }
+            if (!r) return make_error(Errc::invalid_argument, r.error().what);
+            return {};
+        }
+        return make_error(Errc::invalid_argument, "no session " + std::string(id) + " in the history");
+#else
+        (void)id;
+        return no("session history");
+#endif
+    }
+
+    // A line found in the stored output: a running session's pane with the find bar on the
+    // query (the scrollback holds the recent output); a closed one in the Session History window.
+    cmd::Status open_history_output(std::string_view id, std::string_view query, const std::optional<cmd::HistoryLine>& line) override {
+#ifdef KT_HAVE_SESSIONS
+        for (const auto& it : history_items()) {
+            if (it.e.id != id) continue;
+            if (it.state == history::State::closed) return open_output_viewer(it, std::string(query), line);
+            const bool live = it.state == history::State::live;
+            if (!live) {
+                if (auto st = attach_session(it.e.session); !st) return st;
+            }
+            auto at = pane_of_session(it.e.session);
+            if (!at) return reveal_in_history(id);
+            reveal_pane(at->first, at->second);
+            post_alive([this, live, item = it, q = std::string(query), line] {
+                // A live pane answers at once: a line older than its scrollback is only in the
+                // store, so the stored output opens in a viewer instead of a Find with no matches.
+                // (An attached one fills in later; its Find bar says what it finds.)
+                PaneSession* ps = focused_pane();
+                if (live && ps && ps->find(q) == 0) {
+                    ps->end_find();
+                    if (line) (void)open_output_viewer(item, q, line);
+                    else (void)reveal_in_history(item.e.id);
+                    return;
+                }
+                (void)open_find_with(q);
+            });
+            return {};
+        }
+        return make_error(Errc::invalid_argument, "no session " + std::string(id) + " in the history");
+#else
+        (void)id;
+        (void)query;
+        return no("session history");
+#endif
+    }
+
+#ifdef KT_HAVE_SESSIONS
+    // The stored output of a session in its viewer window, at `line` (a search hit or a
+    // command), with Find on `query`. Loaded off the UI thread; the same session's viewer is
+    // reused.
+    cmd::Status open_output_viewer(const history::Item& it, std::string query, std::optional<cmd::HistoryLine> line) {
+        if (!source_ || !r_ || !win_ || !set_) return no("output viewer");
+        const std::string id = it.e.id, name = history::name_of(it.e);
+        const uint64_t created = it.e.created_ms;
+        run_worker([this, id, name, created, query = std::move(query), line = std::move(line)] {
+            Result<session::HistoryOutput> o = make_error(Errc::unavailable, "no state folder");
+            if (auto p = session::os::paths()) {
+                session::OutputWindowOptions wo;
+                if (line) wo.around = session::OutputTarget{line->seq, line->text};
+                o = session::load_history_output(*p, id, wo);
+            }
+            post_alive([this, id, name, created, query, o = std::move(o)]() mutable {
+                if (!o) {
+                    toast(std::string(ui::tr("No stored output of this session")), o.error().what);
+                    (void)reveal_in_history(id);
+                    return;
+                }
+                OutputViewer* v = output_viewer(id, name, created);
+                if (!v) return;
+                v->show(*o, query);
+                v->activate();
+            });
+        });
+        return {};
+    }
+
+    // Export… of a series: the save chooser over `view`, in the folder of the last
+    // export (Downloads, else home, at first); the export on a worker; `done` on the UI thread.
+    // Without a chooser (Linux without zenity or kdialog) it goes straight into that folder.
+    void export_history_output(const std::string& id, const std::string& name, uint64_t created_ms, void* view,
+                               session::ExportFormat f, ExportDone done) {
+        std::string folder = last_export_folder_;
+        if (folder.empty()) {
+            const std::string home = home_dir();
+            folder = session::os::exists(session::os::join(home, "Downloads")) ? session::os::join(home, "Downloads") : home;
+        }
+        const std::string file = session::export_file_name(name, created_ms, f);
+        auto write = [this, id, name, created_ms, f, done = std::move(done)](std::string path) {
+            if (const auto cut = path.find_last_of("/\\"); cut != std::string::npos) last_export_folder_ = path.substr(0, cut);
+            run_worker([this, id, name, created_ms, f, path, done] {
+                Result<session::ExportStats> st = make_error(Errc::unavailable, "no state folder");
+                if (auto p = session::os::paths()) st = session::export_history_to_file(*p, id, f, {name, created_ms}, path);
+                post_alive([done, path, f, st = std::move(st)] {
+                    if (!st) return done(Unexpected(st.error()));
+                    done(ExportResult{path, f == session::ExportFormat::asciicast && !st->sized});
+                });
+            });
+        };
+        if (desktop::pick_save_file(view, std::string(ui::tr("Export the output")), folder, file, write,
+                                    [this](std::function<void()> fn) { post_alive(std::move(fn)); }))
+            return;
+        write(session::os::join(folder, file));
+    }
+
+    OutputViewer* output_viewer(const std::string& id, const std::string& name, uint64_t created_ms) {
+        if (auto f = viewers_.find(id); f != viewers_.end() && f->second.v && f->second.v->is_open()) return f->second.v.get();
+        viewers_.erase(id);
+        OutputViewerSpec spec;
+        UiWindowSpec& w = spec.window;
+        w.title = std::u8string(u8"Output — ") + std::u8string(name.begin(), name.end());
+        w.size = platform::DipSize{1000, 720};
+        w.min_size = platform::DipSize{480, 320};
+        const platform::WindowPlacement pl = win_->placement();
+        if (!pl.maximized && !pl.fullscreen) w.center_over = pl.rect;
+        w.renderer = std::string(render::backend_name(r_->active()));
+        w.render_config = rcfg_;
+        w.font_source = source_.get();
+        w.ui_font = cfg_.ui_font();
+        w.ui_mono_font = cfg_.ui_mono_font();
+        w.theme = uiw_->theme();
+        w.motion = motion_of(cfg_.ui_motion());
+        w.get_clipboard = [this] { return clipboard_cache_; };
+        w.set_clipboard = [this](const std::string& s) {
+            clipboard_cache_ = s;
+            (void)p_.clipboard().write_text(platform::Selection::clipboard, std::u8string(s.begin(), s.end()));
+        };
+        // Posted after the window is gone: by then a new viewer of the same session may be open.
+        w.closed = [this, id, alive = std::weak_ptr<bool>(alive_)] {
+            auto a = alive.lock();
+            if (!a || !*a) return;
+            if (auto f = viewers_.find(id); f != viewers_.end() && (!f->second.v || !f->second.v->is_open())) viewers_.erase(f);
+        };
+        spec.font = font_spec();
+        spec.files = files_;
+        spec.pad_x = pad_dip_x_;
+        spec.pad_y = pad_dip_y_;
+        spec.view.theme = view_theme_;
+        spec.view.pad_x = static_cast<int32_t>(std::round(pad_dip_x_ * scale_));
+        spec.view.pad_y = static_cast<int32_t>(std::round(pad_dip_y_ * scale_));
+        spec.view.smooth_scroll = smooth_scroll_allowed();
+        spec.view.snap_scroll = cfg_.animations_snap_scroll_to_row();
+        spec.term = term_opts_;
+        spec.style = [this](PaneSession& ps) {
+            theme::apply(ts_, ps.view(), ps.effective_colors());
+            ps.set_cursor_defaults(ts_.cursor_shape, ts_.cursor_blink);
+        };
+        spec.clipboard = &p_.clipboard();
+        spec.export_output = [this, id, name, created_ms](session::ExportFormat f, void* view, ExportDone done) {
+            export_history_output(id, name, created_ms, view, f, std::move(done));
+        };
+        auto keys = std::make_unique<cmd::KeymapResolver>(keymap_);
+        cmd::KeymapResolver* kr = keys.get();
+        spec.command_of = [kr](const ui::KeyEvent& k) {
+            cmd::KeyContext kc;
+            kc.bits = cmd::Ctx::Always | cmd::Ctx::Window | cmd::Ctx::Terminal;
+            cmd::ResolvedCommand rc;
+            const cmd::KeyResult r = kr->resolve(k, kc, rc);
+            if (r == cmd::KeyResult::Command && rc.command) return std::string(rc.command->id);
+            if (r != cmd::KeyResult::Passthrough) kr->reset();
+            return std::string();
+        };
+        auto v = OutputViewer::open(p_, std::move(spec));
+        if (!v) {
+            toast(std::string(ui::tr("The output viewer could not be opened")), v.error().what);
+            return nullptr;
+        }
+        Viewer& slot = viewers_[id];
+        slot.keys = std::move(keys);
+        slot.v = std::move(*v);
+        return slot.v.get();
+    }
+
+    bool open_history_window() {
+        if (!source_ || !r_ || !win_) return false;
+        UiWindowSpec spec;
+        spec.title = u8"Session History";
+        spec.size = platform::DipSize{1100, 720};
+        spec.min_size = platform::DipSize{640, 400};
+        const platform::WindowPlacement pl = win_->placement();
+        if (!pl.maximized && !pl.fullscreen) spec.center_over = pl.rect;
+        spec.renderer = std::string(render::backend_name(r_->active()));
+        spec.render_config = rcfg_;
+        spec.font_source = source_.get();
+        spec.ui_font = cfg_.ui_font();
+        spec.ui_mono_font = cfg_.ui_mono_font();
+        spec.theme = uiw_->theme();
+        spec.motion = motion_of(cfg_.ui_motion());
+        spec.get_clipboard = [this] { return clipboard_cache_; };
+        spec.set_clipboard = [this](const std::string& s) {
+            clipboard_cache_ = s;
+            (void)p_.clipboard().write_text(platform::Selection::clipboard, std::u8string(s.begin(), s.end()));
+        };
+        spec.closed = [this] { close_history_window(); };
+        // Increase / Decrease / Reset Font Size (the user's keys for them) zoom the window.
+        history_resolver_ = std::make_unique<cmd::KeymapResolver>(keymap_);
+        spec.keymap = [this](const ui::KeyEvent& k) {
+            if (!history_win_ || !history_resolver_) return false;
+            cmd::KeyContext kc;
+            kc.bits = cmd::Ctx::Always | cmd::Ctx::Window | cmd::Ctx::Terminal;
+            cmd::ResolvedCommand rc;
+            const cmd::KeyResult r = history_resolver_->resolve(k, kc, rc);
+            if (r == cmd::KeyResult::Command && rc.command) {
+                const std::string_view id = rc.command->id;
+                const int step = id == "terminal.font_bigger" ? 1 : id == "terminal.font_smaller" ? -1 : id == "terminal.font_reset" ? 0 : 2;
+                if (step != 2) {
+                    history_win_->step_zoom(step);
+                    return true;
+                }
+            }
+            if (r != cmd::KeyResult::Passthrough) history_resolver_->reset();   // the window's own keys
+            return false;
+        };
+        spec.zoom = history_zoom_;
+        spec.zoom_changed = [this](float z) { history_zoom_ = z; };
+        spec.focus_changed = [this, alive = alive_](bool focused) {
+            if (!focused) return;
+            if (history_ && history_->view()) history_->reload();
+            p_.clipboard().read_text(platform::Selection::clipboard, [this, alive](Result<std::u8string> r) {
+                if (*alive && r) clipboard_cache_.assign(r->begin(), r->end());
+            });
+        };
+        auto host = UiWindowHost::create(p_, std::move(spec));
+        if (!host) {
+            log::warn("gui", "the Session History window could not be opened, showing it over the main window: " + host.error().what);
+            return false;
+        }
+        history_win_ = std::move(*host);
+        history_->on_close = [this] {
+            if (history_win_) history_win_->close();
+        };
+        history_win_->set_root(history_->make_view());
+        history_win_->show();
+        if (ui::Widget* list = history_win_->ui().find("history/list")) history_win_->ui().set_focus(list, false);
+        return true;
+    }
+
+    void close_history_window() {
+        if (!history_win_) return;
+        history_win_.reset();
+        if (history_) {
+            history_state_ = history_->state();
+            history_->closed();
+            history_.reset();
+        }
+    }
+
+    // The sessions of the history with their state: a pane of the workspace shows it (live),
+    // its host runs without one (background), or it ended (closed).
+    std::vector<history::Item> history_items() {
+        std::vector<history::Item> out;
+        auto p = session::os::paths();
+        if (!p) return out;
+        for (auto& e : session::list_history(*p)) {
+            history::Item it;
+            if (e.state == session::HistoryState::closed) it.state = history::State::closed;
+            else it.state = claimed(e.session) ? history::State::live : history::State::background;
+            it.e = std::move(e);
+            out.push_back(std::move(it));
+        }
+        return out;
+    }
+
+    // The project a restored session opens in: its own (by id, then by name), else Scratch.
+    ws::ProjectId history_project(const session::HistoryEntry& e) const {
+        const std::string id = e.project.kind() == session::json::Value::Kind::Object ? e.project.str_or("id") : std::string();
+        const std::string name = e.project_name();
+        for (const ws::Project& pr : model().projects())
+            if (!id.empty() && pr.id.to_string() == id) return pr.id;
+        for (const ws::Project& pr : model().projects())
+            if (!name.empty() && pr.name == name) return pr.id;
+        return ws::kScratchProject;
+    }
+
+    // A new tab that takes over a session host started for it.
+    Result<void> adopt_into_tab(ws::ProjectId project, const std::string& sid, const std::string& cwd) {
+        auto id = session::SessionId::parse(sid);
+        if (!id) return make_error(Errc::invalid_argument, "not a session id: " + sid);
+        ws::NewPaneSpec spec;
+        if (!cwd.empty()) spec.cwd = cwd;
+        spec.adopt = *id;
+        auto tab = model().new_tab(project, std::move(spec));
+        if (!tab) return make_error(Errc::unavailable, "the restored session has no tab: " + tab.error().message);
+        after_command();
+        if (win_) win_->show(true);
+        return {};
+    }
+
+    HistoryEnv history_env() {
+        HistoryEnv env;
+        env.load = [this] { return history_items(); };
+        env.commands = [](const std::string& id) {
+            auto p = session::os::paths();
+            return p ? session::history_commands(*p, id) : std::vector<session::HistoryCommand>{};
+        };
+        env.now_ms = [] {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        };
+        env.search_output = [this](const std::string& text, std::function<void(history::OutputMatches)> done) {
+            if (!history_window_search_)
+                history_window_search_ = std::make_unique<HistoryWindowSearch>([this](std::function<void()> fn) { post_alive(std::move(fn)); });
+            history_window_search_->start(text, std::move(done));
+        };
+        env.open_output = [this](const history::Item& it, const std::string& text,
+                                 const std::optional<commands::HistoryLine>& line) -> Result<void> {
+            if (auto st = open_history_output(it.e.id, text, line); !st) return make_error(Errc::invalid_argument, st.error().what);
+            return {};
+        };
+        env.export_output = [this](const history::Item& it, session::ExportFormat f, ExportDone done) {
+            export_history_output(it.e.id, history::name_of(it.e), it.e.created_ms,
+                                  history_win_ ? history_win_->native_view() : surface_view_, f, std::move(done));
+        };
+        env.show = [this](const history::Item& it) -> Result<void> {
+            auto at = pane_of_session(it.e.session);
+            if (!at) return make_error(Errc::invalid_argument, "another window shows this session");
+            reveal_pane(at->first, at->second);
+            if (win_) win_->show(true);
+            return {};
+        };
+        env.attach = [this](const history::Item& it) -> Result<void> {
+            if (auto st = attach_session(it.e.session); !st) return make_error(Errc::invalid_argument, st.error().what);
+            if (win_) win_->show(true);
+            return {};
+        };
+        // Restore: a new host from the series' last folder or its archive (plan_restore), started
+        // off the UI thread; a new tab of the session's project takes it over.
+        env.restore = [this](const history::Item& it, std::optional<size_t> run, HistoryEnv::RestoreDone done) -> Result<void> {
+            auto plan = session::plan_restore(it.e);
+            if (!plan) return Unexpected(plan.error());
+            session::HostSpawnOptions o;
+            o.cwd = plan->cwd;
+            o.extra = plan->host_args(run);
+            for (const auto& a : opts_.gui.config_flags()) o.extra.push_back(a);
+            const ws::ProjectId project = history_project(it.e);
+            // Started from the history window, its toasts show there (the main window is behind it).
+            if (!done) toast(std::string(ui::tr("Restoring the session")), it.e.display_title());
+            run_worker([this, o = std::move(o), project, cwd = plan->cwd, done = std::move(done)] {
+                auto h = session::spawn_host(o);
+                post_alive([this, h = std::move(h), project, cwd, done] {
+                    Result<void> r = h ? adopt_into_tab(project, h->id.str(), cwd) : Result<void>(Unexpected(h.error()));
+                    if (done && done(r)) return;
+                    if (!r) toast(std::string(ui::tr("The session was not restored")), r.error().what);
+                    if (history_ && history_->view()) history_->reload();
+                });
+            });
+            return {};
+        };
+        // Resume in a running session: the pane's own resume (the last run) when at a prompt.
+        env.resume = [this](const history::Item& it, size_t run) -> Result<void> {
+            if (run + 1 != it.e.agents.size())
+                return make_error(Errc::invalid_argument, "only the last agent run resumes in a running session");
+            auto at = pane_of_session(it.e.session);
+            if (!at) {
+                if (auto st = attach_session(it.e.session); !st) return make_error(Errc::invalid_argument, st.error().what);
+                at = pane_of_session(it.e.session);
+                if (!at) return make_error(Errc::invalid_argument, "the session is not in a tab yet; try again");
+            }
+            reveal_pane(at->first, at->second);
+            send_pane_option(at->second, "agent.resume_now", "1", std::string(ui::tr("Resuming the agent session")));
+            if (win_) win_->show(true);
+            return {};
+        };
+        env.rename = [](const std::string& id, const std::string& title) -> Result<void> {
+            auto p = session::os::paths();
+            if (!p) return Unexpected(p.error());
+            return session::set_history_title(*p, id, title);
+        };
+        env.tag = [](const std::string& id, const std::vector<std::string>& add, const std::vector<std::string>& remove) -> Result<void> {
+            auto p = session::os::paths();
+            if (!p) return Unexpected(p.error());
+            return session::tag_history(*p, id, add, remove);
+        };
+        env.pin = [](const std::string& id, bool pinned) -> Result<void> {
+            auto p = session::os::paths();
+            if (!p) return Unexpected(p.error());
+            return session::pin_history(*p, id, pinned);
+        };
+        env.remove = [](const std::string& id) -> Result<uint64_t> {
+            auto p = session::os::paths();
+            if (!p) return Unexpected(p.error());
+            return session::delete_history(*p, id);
+        };
+        env.open_settings = [this] {
+            post_alive([this] {
+                (void)open_settings();
+                if (settings_ && settings_->view()) settings_->show_pane("history");
+            });
+        };
+        env.retention_note = [this] {
+            const config::Config& c = cfg_svc_ ? cfg_svc_->current() : cfg_;
+            const int64_t keep = c.get_int(config::KeyId::storage_keep_closed);
+            if (keep <= 0) return std::string(ui::tr("nothing is deleted automatically"));
+            return std::string(ui::tr("closed sessions are deleted after ")) + history::duration_text(static_cast<uint64_t>(keep));
+        };
+        return env;
+    }
+#endif
 
     cmd::Status reload_config() override {
         if (!cfg_svc_) return no("reload config");
@@ -3619,6 +4318,7 @@ private:
             return it == panes_.end() ? nullptr : it->second.get();
         };
         hooks.app_menu = [this](ui::Rect anchor) { open_app_menu(anchor); };
+        hooks.search_history = [this] { invoke("palette.history", cmd::InvokeSource::Toolbar); };
         hooks.caption_press = [this](ui::Vec2, int clicks) {
 #ifdef __APPLE__
             if (clicks >= 2) mac::title_bar_double_click(surface_view_);
@@ -3653,7 +4353,43 @@ private:
             return ti ? ti->title : std::string();
         };
         pe.after_run = [this] { after_command(); };
-        pe.fill = [this](cmd::palette::PaletteData& d) { fill_palette_sessions(d); };
+        pe.fill = [this](cmd::palette::PaletteData& d) {
+            fill_palette_sessions(d);
+#ifdef KT_HAVE_SESSIONS
+            d.history = [this] {
+                std::vector<cmd::palette::HistoryInfo> v;
+                for (const auto& it : history_items()) {
+                    cmd::palette::HistoryInfo h;
+                    h.id = it.e.id;
+                    h.title = it.e.display_title();
+                    h.project = it.e.project_name();
+                    h.cwd = it.e.cwd_last;
+                    h.state = it.state == history::State::live         ? cmd::palette::HistoryInfo::State::Live
+                              : it.state == history::State::background ? cmd::palette::HistoryInfo::State::Background
+                                                                       : cmd::palette::HistoryInfo::State::Closed;
+                    static const agents::AgentRegistry kAgents = agents::AgentRegistry::builtin();
+                    for (const auto& a : it.e.agents) {
+                        h.agents.push_back(a.agent);
+                        const auto* desc = kAgents.find(a.agent);
+                        h.agent_names.push_back(desc ? std::string(desc->display_name) : a.agent);
+                    }
+                    h.tags = it.e.tags;
+                    h.last_used_ms = static_cast<std::int64_t>(it.e.last_used_ms);
+                    h.ended_ms = static_cast<std::int64_t>(it.e.ended_ms.value_or(0));
+                    h.pinned = it.e.pinned;
+                    v.push_back(std::move(h));
+                }
+                return v;
+            };
+            if (!history_search_) {
+                history_search_ = std::make_unique<HistoryOutputSearch>([this](std::function<void()> fn) { post_alive(std::move(fn)); },
+                                                                        [this] {
+                                                                            if (palette_ && palette_->is_open()) palette_->requery();
+                                                                        });
+            }
+            d.history_search = history_search_.get();
+#endif
+        };
         pe.now_ms = [] {
             return static_cast<std::int64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -3770,6 +4506,7 @@ private:
         apply_smooth_scroll();
         keymap_ = cmd::Keymap::from_config(c, cmd::current_os()).keymap;
         resolver_->set_keymap(keymap_);
+        if (history_resolver_) history_resolver_->set_keymap(keymap_);
         if (owner()) core_.sync_hotkey(c, keymap_);
         if (palette_) palette_->reconfigure();
         apply_theme();
@@ -3960,12 +4697,58 @@ private:
                 ++it;
             }
         }
-        if (monitor_) monitor_->set_sessions(std::move(watch));
+        if (monitor_) {
+            monitor_->set_sessions(std::move(watch));
+            if (rt_ && owner()) {
+                std::vector<std::string> claimed;
+                for (const auto& c : model().claimed_sessions()) claimed.push_back(c.str());
+                monitor_->set_claimed(std::move(claimed));
+            }
+        }
+#ifdef KT_HAVE_SESSIONS
+        sync_history_meta(st);
+#endif
         mv_->sync();
         update_title();
         status_dirty_ = true;
         win_->request_frame();
     }
+
+#ifdef KT_HAVE_SESSIONS
+    // The history files each session under its project and its tab's own name;
+    // the host only learns them from here, so they go to it whenever they change.
+    void sync_history_meta(const ws::StateSnapshot& st) {
+        if (!rt_ || !owner()) return;
+        const std::string home = session::os::home_dir();
+        std::set<std::string> live;
+        for (const auto& [id, pane] : st.panes) {
+            if (pane.bind != ws::BindState::Ready || pane.endpoint.empty()) continue;
+            const auto loc = model().locate(id);
+            if (!loc) continue;
+            std::string project, title;
+            if (const ws::Project* pr = model().project(loc->project)) {
+                auto v = session::json::Value::object();
+                v.set("id", session::json::Value::string(pr->id.to_string()));
+                v.set("name", session::json::Value::string(pr->name));
+                if (pr->color != ws::ColorTag::None) v.set("color", session::json::Value::string(std::string(ws::to_string(pr->color))));
+                if (!pr->path.empty()) v.set("path", session::json::Value::string(session::tilde_path(pr->path, home)));
+                project = v.dump(false);
+            }
+            if (const ws::Tab* t = model().tab(loc->tab); t && t->title_override) title = *t->title_override;
+            const std::string sid = pane.session.str();
+            live.insert(sid);
+            std::string meta = project + '\x1f' + title;
+            auto [at, fresh] = history_meta_.try_emplace(sid);
+            if (!fresh && at->second == meta) continue;
+            at->second = std::move(meta);
+            run_worker([endpoint = pane.endpoint, project, title] {
+                (void)session::send_option(endpoint, "history.project", project, 2000);
+                (void)session::send_option(endpoint, "history.tab_title", title, 2000);
+            });
+        }
+        for (auto it = history_meta_.begin(); it != history_meta_.end();) it = live.count(it->first) ? std::next(it) : history_meta_.erase(it);
+    }
+#endif
 
     std::unique_ptr<PaneSession> make_pane(ws::PaneId id, ui::PaneKey k) {
         view::ViewOptions vo;
@@ -4291,6 +5074,7 @@ private:
         if (r.detached) {
             detached_ = std::move(*r.detached);
             if (sessions_dialog_) refresh_sessions_dialog();
+            if (history_ && history_->view()) history_->reload();
         }
         if (++ticks_ % 15 == 0) changed = true;   // uptime and process counts drift slowly
         if (ui::ResourcePanel* rp = open_panel()) {
@@ -4323,9 +5107,6 @@ private:
         if (status_.attention != badge_) {
             badge_ = status_.attention;
             desktop::set_badge(static_cast<int>(badge_));
-        }
-        if (status_.storage.valid && status_.storage.limit) {
-            status_.storage.label = ui::format_bytes(status_.storage.used) + " of " + ui::format_bytes(status_.storage.limit);
         }
         mv_->set_status(status_);
     }
@@ -4589,11 +5370,14 @@ private:
               {nullptr, nullptr},
               {"Save Layout", "project.save_layout"},
               {"Apply Layout", "project.apply_layout"}}},
-            {"Window",
-             {{"Sessions\xE2\x80\xA6", "session.overview"},
-              {"Quick Terminal", "quick_terminal.toggle"},
+            // Own menu: macOS fills Window with its own items.
+            {"Tools",
+             {{"Session History", "session.history"},
+              {"Search History\xE2\x80\xA6", "palette.history"},
+              {"Sessions\xE2\x80\xA6", "session.overview"},
               {nullptr, nullptr},
               {"Reload Config", "app.reload_config"}}},
+            {"Window", {{"Quick Terminal", "quick_terminal.toggle"}}},
         };
         return defs;
     }
@@ -4755,6 +5539,24 @@ private:
     ui::WidgetId settings_id_ = 0;
     config::Subscription settings_sub_;
     std::unique_ptr<store::Catalog> settings_catalog_;
+    // Session History: the window, its controller, what it remembers between openings.
+    std::unique_ptr<HistoryController> history_;
+    std::unique_ptr<cmd::KeymapResolver> history_resolver_;   // its keys for the zoom
+    float history_zoom_ = 1.0f;                               // its zoom, for the next opening
+    std::unique_ptr<UiWindowHost> history_win_;   // after history_: destroyed first
+    ui::WidgetId history_sheet_ = 0;               // shown over this window when a second one cannot open
+    HistoryUiState history_state_;
+#ifdef KT_HAVE_SESSIONS
+    // Output viewers, one per history id, each with its resolver of the keymap.
+    struct Viewer {
+        std::unique_ptr<cmd::KeymapResolver> keys;
+        std::unique_ptr<OutputViewer> v;
+    };
+    std::map<std::string, Viewer> viewers_;
+    std::unique_ptr<HistoryOutputSearch> history_search_;   // the palette's History scope
+    std::unique_ptr<HistoryWindowSearch> history_window_search_;   // the Session History window's
+    std::map<std::string, std::string> history_meta_;   // session id -> project and tab name last sent
+#endif
 
     std::unique_ptr<platform::IWindow> win_;
     void* surface_view_ = nullptr;
@@ -4809,6 +5611,7 @@ private:
     size_t badge_ = 0;
     uint64_t ticks_ = 0;
     ui::WidgetId find_bar_ = 0;
+    bool find_regex_ = false;   // the find bar's .* toggle, kept while the app runs
 
     cmd::Keymap keymap_;
     std::unique_ptr<cmd::KeymapResolver> resolver_;
@@ -4820,6 +5623,7 @@ private:
     std::unique_ptr<ui::Window> uiw_;
     ui::MainView* mv_ = nullptr;
     std::string clipboard_cache_;
+    std::string last_export_folder_;   // of the last Export…
     platform::TimerId ui_timer_ = 0, tick_timer_ = 0;
 
     std::unique_ptr<Monitor>& monitor_;           // AppCore's

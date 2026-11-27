@@ -31,6 +31,8 @@ enum class Control : std::uint8_t {
     WideText,    // a text field under the label at full width (lists, tables)
     Color,
     FontFamily,  // a dropdown of the installed monospace families
+    Preset,      // a dropdown of fixed values of a non-enum key (`options`: "24h=1 day|...");
+                 // another value shows as "Custom: <value>"
 };
 
 // OS mask of a row (rows for keys that only one OS reads).
@@ -58,7 +60,7 @@ struct GroupDef {
 };
 
 // Panes with content beyond rows; the controller adds it.
-enum class Special : std::uint8_t { None, General, Appearance, Keymaps, Agents, Storage, Advanced, QuickTerminal };
+enum class Special : std::uint8_t { None, General, Appearance, Keymaps, Agents, History, Storage, Advanced, QuickTerminal };
 
 struct PaneDef {
     PaneDef(std::string_view i, std::string_view t, ui::Icon ic, Special sp, std::vector<GroupDef> g, std::uint8_t o = kAll)

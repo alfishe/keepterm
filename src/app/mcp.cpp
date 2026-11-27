@@ -157,7 +157,9 @@ V tools_list() {
     return r;
 }
 
-bool served(const Context& ctx, std::string_view name) {
+bool served(const Context& ctx, const CommandInfo& c) {
+    if (!c.local.empty()) return static_cast<bool>(ctx.run_local);
+    const std::string_view name = c.name;
     return ctx.commands.empty() || std::find(ctx.commands.begin(), ctx.commands.end(), name) != ctx.commands.end();
 }
 
@@ -173,6 +175,34 @@ V call_search(const Context& ctx, const V& args) {
     return text_result(out.dump(false), false);
 }
 
+// A local command: the CLI's own output. With --json the CLI prints {ok, data} or {ok, error}
+// as a wire response does; otherwise its text.
+V call_local(const Context& ctx, const CommandInfo& info, const V& args) {
+    auto argv = local_argv(info, args);
+    if (!argv) return text_result(argv.error().what, true);
+    auto run = ctx.run_local(*argv, info.timeout_ms);
+    if (!run) return text_result("cannot run keepterm: " + run.error().what, true);
+    std::string out = run->out, err = run->err;
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+    if (run->timed_out) return text_result("timeout: `" + info.cli + "` ran longer than " + std::to_string(info.timeout_ms / 1000) + " s", true);
+    if (info.json) {
+        if (auto v = json::parse(out); v && v->kind() == V::Kind::Object && v->get("ok")) {
+            if (v->bool_or("ok", false)) {
+                const V* d = v->get("data");
+                return text_result(d ? d->dump(false) : std::string("{}"), false);
+            }
+            const V* e = v->get("error");
+            return text_result(e ? e->str_or("code") + ": " + e->str_or("message") : std::string("failed"), true);
+        }
+    }
+    std::string text = run->exit_code == 0 ? out : (err.empty() ? out : (out.empty() ? err : out + "\n" + err));
+    if (run->truncated) text += "\n[output cut]";
+    if (run->exit_code != 0) return text_result("exit " + std::to_string(run->exit_code) + (text.empty() ? "" : ": " + text), true);
+    if (text.empty()) text = err.empty() ? "ok" : err;   // some commands report on stderr only
+    return text_result(std::move(text), false);
+}
+
 V call_invoke(const Context& ctx, const V& args) {
     static std::atomic<std::uint64_t> counter{0};
     const std::string command = args.str_or("command");
@@ -180,12 +210,13 @@ V call_invoke(const Context& ctx, const V& args) {
     const CommandInfo* info = nullptr;
     for (const CommandInfo& c : command_catalog())
         if (c.name == command) info = &c;
-    if (!info || !served(ctx, command)) return text_result("unknown command \"" + command + "\"; `search` lists them", true);
+    if (!info || !served(ctx, *info)) return text_result("unknown command \"" + command + "\"; `search` lists them", true);
     V a = V::object();
     if (const V* given = args.get("args"); given && !given->is_null()) {
         if (given->kind() != V::Kind::Object) return text_result("args must be an object of named arguments", true);
         a = *given;
     }
+    if (!info->local.empty()) return call_local(ctx, *info, a);
     if (info->pane_target && !a.get("pane") && !ctx.default_pane.empty()) a.set("pane", V::string(ctx.default_pane));
     V req = V::object();
     req.set("id", V::string("mcp-" + std::to_string(++counter)));
@@ -205,11 +236,73 @@ V call_invoke(const Context& ctx, const V& args) {
 
 }  // namespace
 
+Result<std::vector<std::string>> local_argv(const CommandInfo& c, const V& args) {
+    std::vector<std::string> out = c.local, tail;
+    for (const auto& [k, v] : args.members()) {
+        if (std::none_of(c.args.begin(), c.args.end(), [&](const ArgInfo& a) { return a.name == k; }))
+            return make_error(Errc::invalid_argument, "`" + c.name + "` has no argument \"" + k + "\"; `search` lists its args");
+    }
+    for (const ArgInfo& a : c.args) {
+        const V* v = args.get(a.name);
+        if (!v || v->is_null()) {
+            if (a.required) return make_error(Errc::invalid_argument, "`" + c.name + "` needs \"" + a.name + "\"");
+            continue;
+        }
+        std::vector<std::string> values;
+        if (a.type == "boolean") {
+            if (v->kind() != V::Kind::Bool) return make_error(Errc::invalid_argument, "\"" + a.name + "\" is a boolean");
+            const bool on = *v->as_bool();
+            if (on != a.negate) out.push_back(a.flag);
+            continue;
+        }
+        auto scalar = [&](const V& x) -> std::optional<std::string> {
+            if (const std::string* s = x.as_string()) return *s;
+            if (x.kind() != V::Kind::Number) return std::nullopt;
+            if (auto i = x.as_int()) return std::to_string(*i);
+            return x.dump(false);
+        };
+        if (a.type == "array") {
+            const auto* items = v->as_array();
+            if (!items) return make_error(Errc::invalid_argument, "\"" + a.name + "\" is an array");
+            for (const V& x : *items) {
+                auto s = scalar(x);
+                if (!s) return make_error(Errc::invalid_argument, "\"" + a.name + "\" holds strings or numbers");
+                values.push_back(*s);
+            }
+        } else {
+            auto s = scalar(*v);
+            if (!s) return make_error(Errc::invalid_argument, "\"" + a.name + "\" is a " + a.type);
+            if (a.type == "integer" && !v->as_int())
+                return make_error(Errc::invalid_argument, "\"" + a.name + "\" is an integer");
+            values.push_back(*s);
+        }
+        for (std::string& x : values) {
+            if (a.flag.empty()) {
+                // A positional word must not read as an option.
+                if (x.starts_with("-")) return make_error(Errc::invalid_argument, "\"" + a.name + "\" cannot start with '-'");
+                out.push_back(std::move(x));
+            } else if (a.flag == "--") {
+                tail.push_back(std::move(x));
+            } else {
+                out.push_back(a.flag);
+                out.push_back(std::move(x));
+            }
+        }
+    }
+    if (c.json) out.emplace_back("--json");
+    if (!tail.empty()) {
+        out.emplace_back("--");
+        for (std::string& x : tail) out.push_back(std::move(x));
+    }
+    return out;
+}
+
 std::vector<const CommandInfo*> search(std::string_view query, std::size_t limit, const std::vector<std::string>& available) {
     const std::vector<std::string> q = words_of(query);
     std::vector<std::pair<int, const CommandInfo*>> hits;
     for (const CommandInfo& c : command_catalog()) {
-        if (!available.empty() && std::find(available.begin(), available.end(), c.name) == available.end()) continue;
+        // Local commands run without the app, so they are there whatever the app serves.
+        if (!available.empty() && c.local.empty() && std::find(available.begin(), available.end(), c.name) == available.end()) continue;
         const int s = q.empty() ? 1 : score(c, q);
         if (s > 0) hits.emplace_back(s, &c);
     }

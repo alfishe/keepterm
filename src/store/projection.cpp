@@ -99,7 +99,12 @@ Result<void> TextProjector::line(std::string_view utf8, uint64_t seq, uint64_t t
 }
 
 void ScrollbackTap::attach(const vt::Terminal& t) {
-    next_ = t.scrollback().next_abs_line();
+    const vt::Scrollback& sb = t.scrollback();
+    const uint64_t first = sb.first_abs_line();
+    next_ = sb.next_abs_line();
+    // Back to the first row of the logical line the newest rows belong to: its head left the
+    // screen before the attach and has not been stored as a line yet.
+    while (next_ > first && (sb.line(static_cast<std::size_t>(next_ - 1 - first)).flags & vt::kRowWrapped) != 0) --next_;
     pending_.clear();
 }
 

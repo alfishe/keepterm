@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "platform_gui/platform.h"
 #include "render/render_select.h"
@@ -48,6 +49,12 @@ struct UiWindowSpec {
     // The window went away (closed by the user or by close()); runs once, on a later loop turn
     // when the host may destroy this object.
     std::function<void()> closed;
+    // The content zoom to open with (UiWindowHost::set_zoom), and a change of it.
+    float zoom = 1.0f;
+    std::function<void(float)> zoom_changed;
+    // The scale the widgets draw at (the display's times the zoom) changed: a terminal in the
+    // window rebuilds its font for it.
+    std::function<void(float ui_scale)> scale_changed;
 };
 
 class UiWindowHost final : public platform::IWindowListener {
@@ -59,6 +66,9 @@ public:
     UiWindowHost& operator=(const UiWindowHost&) = delete;
 
     ui::Window& ui() { return *uiw_; }
+    // The native view of the window's surface (an NSView, an HWND; null on Linux): what the
+    // system choosers (app/desktop.h) attach to.
+    void* native_view() const { return native_view_; }
     void set_root(std::unique_ptr<ui::Widget>);
     void show();
     void activate();   // brings an open window to the front
@@ -69,6 +79,25 @@ public:
     void set_theme(const ui::Theme&);
     void set_motion(ui::MotionLevel);
     void set_ui_fonts(const std::string& ui_font, const std::string& ui_mono_font);
+    // The window's content zoom (its text and controls, as the browser's Cmd/Ctrl +/-), on top
+    // of the display scale: kZoomMin..kZoomMax, 1 = actual size.
+    static constexpr float kZoomMin = 0.5f, kZoomMax = 2.0f, kZoomStep = 0.1f;
+    void set_zoom(float zoom);
+    float zoom() const { return zoom_; }
+    // One step larger (+1), smaller (-1) or back to actual size (0).
+    void step_zoom(int delta);
+    // A command for this window from the app menu (the macOS menu bar runs Cmd chords before
+    // any view): Increase / Decrease / Reset Font Size zoom it. False: not one of its commands.
+    bool menu_command(std::string_view id);
+    // The renderer's scale: the display's, whatever the zoom (the widgets draw in pixels at
+    // display scale x zoom; the zoom never reaches the surface).
+    float render_scale() const;
+    // What a terminal shown in the window draws with (the output viewer): the window's font
+    // system and glyph textures, and the scale of its widgets. Valid while open().
+    text::FontSystem& font_system() { return *fonts_; }
+    view::AtlasTextures* textures() { return tex_.get(); }
+    float ui_scale() const { return scale_ * zoom_; }
+    void request_frame();
 
     // platform::IWindowListener
     void on_close_requested() override;
@@ -91,7 +120,6 @@ private:
     void draw();
     void arm_timer(ui::TimePoint at);
     void drop_render();
-    void request_frame();
 
     platform::IPlatform& p_;
     UiWindowSpec spec_;
@@ -102,7 +130,11 @@ private:
     std::unique_ptr<view::AtlasTextures> tex_;
     std::unique_ptr<ui::Window> uiw_;
     platform::PxSize px_;
-    float scale_ = 1.0f;
+    float scale_ = 1.0f;   // the display's
+    float zoom_ = 1.0f;
+    void* native_view_ = nullptr;
+    float scale_sent_ = 0;   // the ui_scale() scale_changed last reported
+    void apply_scale();
     bool full_next_ = true;
     bool occluded_ = false;
     uint64_t timer_ = 0;

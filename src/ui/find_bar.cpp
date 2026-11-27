@@ -5,10 +5,10 @@
 namespace kt::ui {
 
 namespace {
-constexpr float kWidth = 340, kHeight = 36;
+constexpr float kWidth = 370, kHeight = 36;
 }
 
-FindBar::FindBar(FindBarHooks hooks, std::string initial) : Widget("find_bar"), hooks_(std::move(hooks)) {
+FindBar::FindBar(FindBarHooks hooks, std::string initial, bool regex) : Widget("find_bar"), hooks_(std::move(hooks)), regex_(regex) {
     style().dir = LayoutStyle::Dir::Row;
     style().align_items = LayoutStyle::Align::Center;
     style().width = kWidth;
@@ -21,19 +21,34 @@ FindBar::FindBar(FindBarHooks hooks, std::string initial) : Widget("find_bar"), 
     field_->style().grow = 1;
     field_->style().shrink = 1;
     field_->style().basis = 0.0f;
-    field_->on_change = [this](const std::string& q) {
-        if (hooks_.query) show(hooks_.query(q));
-    };
+    field_->on_change = [this](const std::string&) { query(); };
     // Enter (the next older match) and Shift+Enter bubble up to on_key.
     field_->on_cancel = [this] { close(); };
+    auto rx = std::make_unique<Button>(".*", [this] { set_regex(!regex_); }, Button::Kind::plain, "regex");
+    rx->set_tooltip(std::string(tr("Regular Expression")));
+    rx->set_checked(regex_);
+    rx->style().width = 26.0f;
+    rx->style().height = 24.0f;
+    regex_btn_ = &add(std::move(rx));
     count_ = &emplace<Label>("", TextStyle::small, Tone::muted, "count");
     add(Button::icon_button(Icon::chevron_down, std::string(tr("Previous Match")), [this] { step(-1); }, "previous", 24));
     add(Button::icon_button(Icon::chevron_right, std::string(tr("Next Match")), [this] { step(1); }, "next", 24));
     add(Button::icon_button(Icon::close, std::string(tr("Close")), [this] { close(); }, "close", 24));
     if (!initial.empty()) {
         field_->set_text(initial);
-        if (hooks_.query) show(hooks_.query(initial));
+        query();
     }
+}
+
+void FindBar::query() {
+    if (hooks_.query) show(hooks_.query(field_->text(), regex_));
+}
+
+void FindBar::set_regex(bool on) {
+    if (on == regex_) return;
+    regex_ = on;
+    regex_btn_->set_checked(on);
+    query();
 }
 
 EventResult FindBar::on_key(const KeyEvent& k) {
@@ -45,10 +60,14 @@ EventResult FindBar::on_key(const KeyEvent& k) {
     return EventResult::Ignored;
 }
 
-void FindBar::show(std::pair<size_t, std::optional<size_t>> r) {
+void FindBar::show(const FindResult& r) {
+    count_->set_tone(!r.error.empty() ? Tone::failure : !r.partial.empty() ? Tone::warning : Tone::muted);
+    count_->set_tooltip(!r.error.empty() ? r.error : r.partial.empty() ? std::string() : std::string(tr("Stopped: ")) + r.partial);
+    const std::string more = r.partial.empty() ? "" : "+";
     if (field_->text().empty()) count_->set_text({});
-    else if (r.first == 0) count_->set_text(std::string(tr("No matches")));
-    else count_->set_text(std::to_string(r.second ? *r.second + 1 : 0) + " " + std::string(tr("of")) + " " + std::to_string(r.first));
+    else if (!r.error.empty()) count_->set_text(std::string(tr("Invalid pattern")));
+    else if (r.count == 0) count_->set_text(std::string(tr("No matches")) + more);
+    else count_->set_text(std::to_string(r.current ? *r.current + 1 : 0) + " " + std::string(tr("of")) + " " + std::to_string(r.count) + more);
 }
 
 void FindBar::step(int delta) {
@@ -61,7 +80,7 @@ void FindBar::close() {
     if (hooks_.closed) hooks_.closed();   // the owner closes the overlay
 }
 
-std::string FindBar::describe() const { return field_->text() + " | " + count_->text(); }
+std::string FindBar::describe() const { return (regex_ ? "/" + field_->text() + "/" : field_->text()) + " | " + count_->text(); }
 
 void FindBar::paint(PaintContext& p) const {
     const Theme& t = p.theme;
@@ -71,7 +90,7 @@ void FindBar::paint(PaintContext& p) const {
                     t.fg.with_alpha(t.scheme == Scheme::dark ? 0.14f : 0.12f));
 }
 
-WidgetId show_find_bar(Window& w, FindBarHooks hooks, Vec2 top_right, std::string initial) {
+WidgetId show_find_bar(Window& w, FindBarHooks hooks, Vec2 top_right, std::string initial, bool regex) {
     OverlayOptions o;
     o.placement = OverlayOptions::Placement::At;
     o.anchor = Rect{top_right.x - kWidth, top_right.y, 0, 0};
@@ -80,7 +99,7 @@ WidgetId show_find_bar(Window& w, FindBarHooks hooks, Vec2 top_right, std::strin
     o.dismiss_on_outside_click = false;
     o.dismiss_on_escape = false;   // Escape goes to the field (on_cancel)
     o.take_focus = true;
-    auto bar = std::make_unique<FindBar>(std::move(hooks), std::move(initial));
+    auto bar = std::make_unique<FindBar>(std::move(hooks), std::move(initial), regex);
     TextField* f = &bar->field();
     const WidgetId id = w.show_overlay(std::move(bar), o);
     w.set_focus(f, true);

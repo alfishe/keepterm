@@ -84,6 +84,19 @@ json::Value error_response(const std::string& id, std::string_view code, std::st
 // own session on POSIX, out of the caller's job on Windows when allowed). Its pid.
 Result<uint32_t> launch_gui(const std::vector<std::string>& args);
 
+// This executable run with `args` as a CLI, its output captured: what MCP `invoke` does for the
+// commands the CLI runs without the app (session list, history search, ...). The child is
+// killed after `timeout_ms`; each stream keeps at most `max_bytes`.
+struct SelfRun {
+    int exit_code = -1;
+    bool timed_out = false;
+    bool truncated = false;
+    std::string out, err;
+};
+Result<SelfRun> run_self(const std::vector<std::string>& args, int timeout_ms, std::size_t max_bytes);
+// The same for any program (a full path): what run_self does with this executable.
+Result<SelfRun> run_program(const std::string& exe, const std::vector<std::string>& args, int timeout_ms, std::size_t max_bytes);
+
 // The GUI side. `handle` runs on a connection thread with the request object and returns the
 // response object (the GUI posts to its UI thread and waits).
 class Server {
@@ -120,6 +133,11 @@ struct ArgInfo {
     std::string type;   // "string", "boolean", "integer", "number", "array"
     std::string help;
     bool required = false;
+    // For a command the CLI runs locally (CommandInfo::local): how the argument is spelled.
+    // Empty: the next positional word; "--x": a flag (a boolean adds it when true, other types
+    // add it with the value); "--": the text after "--".
+    std::string flag;
+    bool negate = false;   // a boolean whose flag is added when false ("--no-submit")
 };
 struct CommandInfo {
     std::string name;   // the wire command ("pane.split")
@@ -127,6 +145,11 @@ struct CommandInfo {
     std::string help;
     std::vector<ArgInfo> args;
     bool pane_target = false;   // `pane` defaults to the caller's pane
+    // Not a wire command: the CLI words that run it without the app ("--history", "search"),
+    // the arguments follow as ArgInfo::flag says. MCP runs this executable with them.
+    std::vector<std::string> local;
+    bool json = false;          // the CLI takes --json for it
+    int timeout_ms = 60000;     // local commands: how long the run may take
 };
 const std::vector<CommandInfo>& command_catalog();
 

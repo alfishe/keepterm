@@ -415,6 +415,17 @@ struct ParserCodec {
         const uint8_t u_lo = r.u8();
         const uint8_t u_hi = r.u8();
         if (!r.ok || u_need > 3 || param_acc > 0xFFFF || u_cp > 0x10FFFF) return false;
+        // A UTF-8 sequence in progress must be one the decoder itself could be in: continuation
+        // bytes only (10xxxxxx), and no way to end above U+10FFFF or on a surrogate. A forged
+        // range took an ESC for a continuation and printed code point 0x1F401B, which no
+        // snapshot can hold (fuzzing).
+        if (u_need != 0) {
+            if (u_lo < 0x80 || u_hi > 0xBF || u_lo > u_hi) return false;
+            const uint32_t rest = 6u * (u_need - 1u);
+            const uint32_t lo = ((u_cp << 6) | (u_lo & 0x3Fu)) << rest;
+            const uint32_t hi = (((u_cp << 6) | (u_hi & 0x3Fu)) << rest) | ((1u << rest) - 1u);
+            if (hi > 0x10FFFF || (lo <= 0xDFFF && hi >= 0xD800)) return false;
+        }
         if (osc.size() > p.opts_.max_osc_bytes) {
             osc.clear();
             osc_overflow = true;

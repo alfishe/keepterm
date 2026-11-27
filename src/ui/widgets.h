@@ -58,6 +58,7 @@ public:
 
     void paint(PaintContext&) const override;
     void arrange(const Rect&) override;
+    void on_text_metrics_changed() override;
 
 protected:
     Size intrinsic_size(Size available) const override;
@@ -108,6 +109,10 @@ private:
 
 class Button : public Widget {
 public:
+    void on_text_metrics_changed() override {
+        run_.reset();
+        Widget::on_text_metrics_changed();
+    }
     enum class Kind : uint8_t { primary, secondary, plain, icon, danger };
     Button(std::string label, std::function<void()> on_click, Kind kind = Kind::secondary, std::string id = {});
     static std::unique_ptr<Button> icon_button(Icon icon, std::string tooltip, std::function<void()> on_click, std::string id = {},
@@ -279,6 +284,9 @@ public:
     size_t painted_rows() const { return painted_; }
 
     std::function<void(size_t)> on_select;
+    // Instead of on_select when set: with the modifiers of the click (Shift, Cmd/Ctrl), or
+    // mod_shift for Shift with a navigation key; the owner keeps a selection of several rows.
+    std::function<void(size_t, uint16_t mods)> on_select_mods;
     std::function<void(size_t)> on_activate;
     std::function<void(size_t, Vec2)> on_context;
 
@@ -306,6 +314,10 @@ private:
 // A pill: optional icon and a short text ("512 MB", "Zoomed").
 class Badge : public Widget {
 public:
+    void on_text_metrics_changed() override {
+        run_.reset();
+        Widget::on_text_metrics_changed();
+    }
     explicit Badge(std::string text = {}, Icon icon = Icon::none, Tone tone = Tone::muted, std::string id = {});
     void set_text(std::string);
     const std::string& text() const { return text_; }
@@ -489,5 +501,11 @@ private:
 };
 
 WidgetId show_dialog(Window&, DialogSpec spec);
+
+// Draws a text with its matches (byte offset, length) on a highlight, at most max_w wide, the top
+// of the line at `top`; a long text is cut in front so that the first match shows. Returns the
+// drawn width.
+float paint_marked(PaintContext& p, std::string text, std::vector<std::pair<size_t, size_t>> marks, FontRole role, float x,
+                   float top, float max_w, Color fg);
 
 }  // namespace kt::ui

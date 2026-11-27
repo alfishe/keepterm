@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 
+#include "session/archive.h"
 #include "session/client.h"
 #include "session/history.h"
 #include "session/os.h"
@@ -198,8 +199,8 @@ Result<void> end_session_impl(const os::Paths& p, const SessionId& sid) {
         k.mode = proto::KillMode::KillTree;
         auto r = request_kill(d->record.endpoint, k);
         if (r && r->ok) {
-            // The host deletes its folder and record when the shell is gone.
-            for (int i = 0; i < 60; ++i) {
+            // The host archives its folder and removes its record when the shell is gone.
+            for (int i = 0; i < 200; ++i) {
                 if (!os::process_matches(d->record.host.pid, d->record.host.start_time)) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
@@ -217,7 +218,16 @@ Result<void> end_session_impl(const os::Paths& p, const SessionId& sid) {
     (void)os::remove_file(os::endpoint_name(p, *id));
 #endif
     const bool had_dir = os::is_dir(dir);
-    (void)os::remove_tree(dir);
+    if (had_dir) {
+        // The host archives its session when it ends; a dead or killed one leaves the folder.
+        ArchiveOptions ao;
+        ao.state = p.state;
+        ao.close_reason = "killed";
+        ao.busy_wait = std::chrono::seconds(5);  // the killed host may hold its locks a moment longer
+        auto r = archive_session(dir, ao);
+        if (!r) return make_error(r.error().code, "cannot archive the session: " + r.error().what);
+        if (r->outcome == ArchiveOutcome::busy) return make_error(Errc::busy, "the session's history is in use; try again");
+    }
     if (!done && !had_dir && !d) return make_error(Errc::invalid_argument, "no such session: " + id->str());
     return {};
 }

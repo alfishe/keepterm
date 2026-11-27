@@ -138,6 +138,15 @@ std::string format_bytes(uint64_t b) {
     return buf;
 }
 
+StorageUsage storage_usage(uint64_t used, uint64_t limit) {
+    StorageUsage u;
+    u.valid = true;
+    u.used = used;
+    u.limit = limit == UINT64_MAX ? 0 : limit;
+    u.label = u.limit ? format_bytes(used) + " of " + format_bytes(u.limit) : format_bytes(used);
+    return u;
+}
+
 Icon agent_icon(std::string_view agent) { return agent.empty() ? Icon::terminal : Icon::agent; }
 
 Color agent_color(const Theme& t, std::string_view agent) {
@@ -150,7 +159,7 @@ Color agent_color(const Theme& t, std::string_view agent) {
 
 // ---------------------------------------------------------------- TerminalWidget
 
-TerminalWidget::TerminalWidget(MainView& mv, PaneKey pane) : Widget("terminal"), mv_(mv), pane_(pane) {
+TerminalWidget::TerminalWidget(ITerminalHost& host, PaneKey pane) : Widget("terminal"), host_(host), pane_(pane) {
     style().grow = 1;
 }
 
@@ -158,7 +167,7 @@ TerminalWidget::~TerminalWidget() {
     if (flash_timer_ && window()) window()->cancel_timer(flash_timer_);
 }
 
-ITerminalSurface* TerminalWidget::surface() const { return mv_.hooks().terminal ? mv_.hooks().terminal(pane_) : nullptr; }
+ITerminalSurface* TerminalWidget::surface() const { return host_.terminal(pane_); }
 
 bool TerminalWidget::paint_external(Compositor& c) {
     ITerminalSurface* s = surface();
@@ -175,7 +184,8 @@ bool TerminalWidget::paint_external(Compositor& c) {
     // The scrollbar lives in paint_over: repaint it when the scroll position moved (wheel, keys,
     // prompt jumps, new output while scrolled up).
     const ScrollMetrics m = s->scroll_metrics();
-    if (m.history != painted_.history || m.offset != painted_.offset || m.rows != painted_.rows) {
+    if (m.history != painted_.history || m.offset != painted_.offset || m.rows != painted_.rows || m.marks != painted_.marks ||
+        m.current_mark != painted_.current_mark) {
         if (m.offset != painted_.offset && m.history == painted_.history) bar_flash();
         invalidate_paint();
     }
@@ -206,7 +216,7 @@ TerminalWidget::Bar TerminalWidget::bar_geometry(const ScrollMetrics& m) const {
 bool TerminalWidget::bar_shown(const ScrollMetrics& m) const {
     if (m.history == 0) return false;
     const Window* w = window();
-    return m.offset > 0 || bar_hover_ || bar_drag_ || (w && w->now() < flash_until_);
+    return m.offset > 0 || !m.marks.empty() || bar_hover_ || bar_drag_ || (w && w->now() < flash_until_);
 }
 
 void TerminalWidget::bar_flash() {
@@ -272,8 +282,7 @@ EventResult TerminalWidget::on_pointer(PointerEvent& e) {
         if (bar_pointer(e)) return EventResult::Handled;
         // The pane menu, unless the program takes mouse reports (Shift forces the menu).
         if (e.type == PointerEvent::Type::Press && e.button == platform::MouseButton::right &&
-            (!s->wants_mouse() || (e.mods & platform::mod_shift))) {
-            mv_.pane_menu(pane_, e.pos);
+            (!s->wants_mouse() || (e.mods & platform::mod_shift)) && host_.terminal_menu(pane_, e.pos)) {
             return EventResult::Handled;
         }
         s->pointer(e, e.local);
@@ -311,6 +320,14 @@ void TerminalWidget::paint_over(PaintContext& p) const {
                 const Color fg = Color::rgb(m.fg);
                 if (bar_hover_ || bar_drag_) p.dl.round_rect(g.track, g.track.w / 2, fg.with_alpha(0.10f));
                 p.dl.round_rect(g.thumb, g.thumb.w / 2, fg.with_alpha(bar_drag_ ? 0.65f : bar_hover_ ? 0.5f : 0.35f));
+                // Find matches: ticks over the thumb, the current one taller and opaque.
+                const Color tick = Color::rgb(0xF5A623);
+                auto tick_at = [&](uint16_t v, float h, float a) {
+                    const float y = g.track.y + (static_cast<float>(v) + 0.5f) / kScrollMarks * g.track.h;
+                    p.dl.rect(Rect{g.track.x, std::round(y - h / 2), g.track.w, h}, tick.with_alpha(a));
+                };
+                for (uint16_t v : m.marks) tick_at(v, 2, 0.75f);
+                if (m.current_mark) tick_at(*m.current_mark, 4, 1.0f);
             }
         }
     }
@@ -352,12 +369,7 @@ EventResult TerminalWidget::on_text(std::string_view t) {
 
 void TerminalWidget::on_focus(FocusChange f) {
     if (ITerminalSurface* s = surface()) s->set_focused(f == FocusChange::Gained);
-    if (f == FocusChange::Gained) {
-        const WorkspaceSnapshot& snap = mv_.view().snapshot();
-        const TabItem* t = snap.shown_tab();
-        if (t && t->focused != pane_) mv_.view().focus_pane(pane_);
-        if (mv_.hooks().pane_focused) mv_.hooks().pane_focused(pane_);
-    }
+    if (f == FocusChange::Gained) host_.terminal_focused(pane_);
     invalidate_paint();
 }
 
@@ -892,7 +904,7 @@ Sidebar::Sidebar(MainView& mv) : Widget("sidebar"), mv_(mv) {
     style().clip = true;
     style().shrink = 0;
     // Macterm's sidebar header: the toggle right of the traffic lights (macOS); on Windows and
-    // Linux the app menu and the toggle in the same spot.
+    // Linux the app menu and the toggle in the same spot. Then the magnifier: Search History.
     auto top = row("sidebar_top", 4);
     top->style().height = 38.0f;
     top->style().shrink = 0;
@@ -907,6 +919,10 @@ Sidebar::Sidebar(MainView& mv) : Widget("sidebar"), mv_(mv) {
     }
     auto tg = Button::icon_button(Icon::sidebar, std::string(tr("Hide Sidebar")), [this] { mv_.toggle_sidebar(); }, "toggle_sidebar", 26);
     toggle_ = &top->add(std::move(tg));
+    auto se = Button::icon_button(Icon::search, std::string(tr("Search History")), [this] {
+        if (mv_.hooks().search_history) mv_.hooks().search_history();
+    }, "search_history", 26);
+    search_ = &top->add(std::move(se));
     top_ = &add(std::move(top));
     auto list = column("projects");
     list->style().padding = Insets{0, 2, 0, 8};
@@ -1366,6 +1382,10 @@ TitleBar::TitleBar(MainView& mv) : Widget("titlebar"), mv_(mv) {
     }
     auto sb = Button::icon_button(Icon::sidebar, std::string(tr("Show Sidebar")), [this] { mv_.toggle_sidebar(); }, "toggle_sidebar", 26);
     sidebar_btn_ = &add(std::move(sb));
+    auto se = Button::icon_button(Icon::search, std::string(tr("Search History")), [this] {
+        if (mv_.hooks().search_history) mv_.hooks().search_history();
+    }, "search_history", 26);
+    search_btn_ = &add(std::move(se));
     // Macterm's two-line title: the project in bold, the folder below, dim.
     auto title = column("title", 0);
     title->style().shrink = 1;
@@ -1405,6 +1425,7 @@ void TitleBar::update(const WorkspaceSnapshot& s) {
     indicator_->update(s);
     const bool collapsed = !s.sidebar_visible;
     sidebar_btn_->set_visible(collapsed);
+    search_btn_->set_visible(collapsed);
     if (menu_) menu_->set_visible(collapsed);
     const float lead = collapsed && mv_.options().mac_titlebar ? 70.0f : 0.0f;
     if (lead_->cstyle().width != lead) lead_->style().width = lead;
@@ -1838,6 +1859,12 @@ void MainView::project_menu(ProjectKey k, Vec2 at) {
     rm.action = [this, k] { confirm_remove_project(k); };
     items.push_back(rm);
     open_menu(*w, std::move(items), at);
+}
+
+void MainView::terminal_focused(PaneKey pane) {
+    const TabItem* t = view_.snapshot().shown_tab();
+    if (t && t->focused != pane) view_.focus_pane(pane);
+    if (hooks_.pane_focused) hooks_.pane_focused(pane);
 }
 
 void MainView::pane_menu(PaneKey k, Vec2 at) {

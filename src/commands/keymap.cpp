@@ -45,6 +45,8 @@ constexpr DefaultRow kDefaults[] = {
     {"tab.move_up", "ctrl+left", "ctrl+shift+pageup", "="},
     {"tab.move_down", "ctrl+right", "ctrl+shift+pagedown", "="},
 
+    {"session.history", "cmd+y", "ctrl+shift+y", "="},
+
     {"pane.close", "cmd+w", "ctrl+shift+w", "="},
     {"pane.split_right", "cmd+d", "ctrl+shift+d", "="},
     {"pane.split_down", "cmd+shift+d", "ctrl+shift+alt+d", "="},

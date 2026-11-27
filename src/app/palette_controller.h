@@ -46,6 +46,8 @@ public:
     // palette.* settings or sources changed.
     void reconfigure();
     ui::PaletteView* view() const { return view_; }
+    // Searches the typed text again (an asynchronous source answered).
+    void requery() { refresh(); }
 
 private:
     void refresh();

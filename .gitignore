@@ -18,6 +18,7 @@ compile_commands.json
 *.pdb
 *.ilk
 *.exp
+*.mutate-orig
 *.dSYM/
 
 # ---------------------------------------------------------------- local runtime data

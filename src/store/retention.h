@@ -2,7 +2,7 @@
 //
 // A janitor pass, in order:
 //   1. orphans: segment files without catalog rows, rows without files, stale temp files,
-//      empty session folders;
+//      empty session folders, folders whose deletion a crash cut short (kManifestDeleting);
 //   2. expiry by age per kind (max_age; raw_max_age for the raw stream; events_max_age) and
 //      closed sessions (keep_closed);
 //   3. caps: max_per_session, then max_total (closed sessions' oldest segments first, then
@@ -43,14 +43,18 @@ namespace kt::store {
 
 inline constexpr uint64_t kHourMs = 3'600'000;
 inline constexpr uint64_t kDayMs = 24 * kHourMs;
+// A limit or an age that is off (the config's 0, the default: nothing is deleted).
+inline constexpr uint64_t kOff = UINT64_MAX;
+// a + b, kOff when it does not fit (an age that is off never passes).
+inline constexpr uint64_t add_sat(uint64_t a, uint64_t b) { return b > kOff - a ? kOff : a + b; }
 
 struct Policy {
-    uint64_t max_total = 5ull << 30;
-    uint64_t max_per_session = 1ull << 30;
-    uint64_t max_age_ms = 90 * kDayMs;
-    uint64_t keep_closed_ms = 30 * kDayMs;
-    uint64_t events_max_age_ms = 30 * kDayMs;
-    uint64_t raw_max_age_ms = 7 * kDayMs;     // the raw kind; pinned sessions keep it
+    uint64_t max_total = kOff;
+    uint64_t max_per_session = kOff;
+    uint64_t max_age_ms = kOff;
+    uint64_t keep_closed_ms = kOff;
+    uint64_t events_max_age_ms = kOff;
+    uint64_t raw_max_age_ms = kOff;     // the raw kind; pinned sessions keep it
     DiskGuard disk;
     // The cold tier (storage.cold_*): what aged segments are repacked with.
     WriterOptions cold = cold_defaults();
@@ -137,7 +141,12 @@ Result<std::optional<SegmentRow>> rewrite_segments(Catalog& catalog, const std::
 // The writer options a segment was written with (merge and trim keep its tier).
 WriterOptions options_of(const SegmentInfo& info);
 
-// Forgets a session: catalog rows first, then its files and folder.
+// The series manifest (session/archive.h) and its name while the series is deleted: renamed
+// first, so a crash leaves a folder the janitor finishes and the history list skips.
+inline constexpr const char* kSeriesManifest = "manifest.json";
+inline constexpr const char* kManifestDeleting = "manifest.deleting";
+
+// Forgets a session: its manifest marked deleted, then the catalog rows, its files and folder.
 Result<uint64_t> forget_session(Catalog& catalog, const std::filesystem::path& root, const std::string& id);
 
 inline constexpr const char* kJanitorLock = "janitor.lock";
@@ -149,6 +158,9 @@ public:
     struct Options {
         std::chrono::milliseconds interval{std::chrono::hours(1)};
         std::function<Policy()> policy;   // read at every pass (live config)
+        // The policy per session (per-project overrides), built at every pass; null or an empty
+        // function: `policy` for all.
+        std::function<Janitor::PolicyFor()> per_session;
         std::function<void(const JanitorReport&)> on_report;
         // After every pass, with the catalog the pass used (store/usage.h watchers).
         std::function<void(Catalog&, const Policy&)> after_pass;

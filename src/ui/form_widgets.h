@@ -24,6 +24,10 @@ namespace kt::ui {
 // on_commit once when the drag ends or after a key step.
 class Slider : public Widget {
 public:
+    void on_text_metrics_changed() override {
+        run_.reset();
+        Widget::on_text_metrics_changed();
+    }
     Slider(double lo, double hi, double step, double value, std::string id = {});
     void set_value(double v);   // no callback
     double value() const { return value_; }
@@ -61,6 +65,10 @@ private:
 // A value with - and + buttons (integers or floats). Arrow keys step too.
 class Stepper : public Widget {
 public:
+    void on_text_metrics_changed() override {
+        run_.reset();
+        Widget::on_text_metrics_changed();
+    }
     Stepper(double lo, double hi, double step, double value, std::string id = {});
     void set_value(double v);
     double value() const { return value_; }
@@ -99,6 +107,10 @@ struct DropdownOption {
 // below it. Up/Down change the selection without opening.
 class Dropdown : public Widget {
 public:
+    void on_text_metrics_changed() override {
+        run_.reset();
+        Widget::on_text_metrics_changed();
+    }
     explicit Dropdown(std::vector<DropdownOption> options, size_t selected = 0, std::string id = {});
     void set_options(std::vector<DropdownOption> options, size_t selected);
     void set_selected(size_t i);   // no callback
@@ -136,6 +148,10 @@ private:
 
 class SegmentedControl : public Widget {
 public:
+    void on_text_metrics_changed() override {
+        runs_.clear();
+        Widget::on_text_metrics_changed();
+    }
     explicit SegmentedControl(std::vector<std::string> labels, size_t selected = 0, std::string id = {});
     void set_selected(size_t i);   // no callback; npos shows none selected
     size_t selected() const { return selected_; }

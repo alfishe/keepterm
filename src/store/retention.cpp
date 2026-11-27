@@ -17,12 +17,13 @@ Policy policy_from_config(const config::Config& cfg) {
     using config::KeyId;
     Policy p;
     auto u = [](std::int64_t v) { return v > 0 ? static_cast<uint64_t>(v) : uint64_t{0}; };
-    p.max_total = u(cfg.get_int(KeyId::storage_max_total));
-    p.max_per_session = u(cfg.get_int(KeyId::storage_max_per_session));
-    p.max_age_ms = u(cfg.get_int(KeyId::storage_max_age));
-    p.keep_closed_ms = u(cfg.get_int(KeyId::storage_keep_closed));
-    p.events_max_age_ms = u(cfg.get_int(KeyId::storage_events_max_age));
-    p.raw_max_age_ms = u(cfg.get_int(KeyId::storage_raw_max_age));
+    auto limit = [](std::int64_t v) { return v > 0 ? static_cast<uint64_t>(v) : kOff; };  // 0 = off
+    p.max_total = limit(cfg.get_int(KeyId::storage_max_total));
+    p.max_per_session = limit(cfg.get_int(KeyId::storage_max_per_session));
+    p.max_age_ms = limit(cfg.get_int(KeyId::storage_max_age));
+    p.keep_closed_ms = limit(cfg.get_int(KeyId::storage_keep_closed));
+    p.events_max_age_ms = limit(cfg.get_int(KeyId::storage_events_max_age));
+    p.raw_max_age_ms = limit(cfg.get_int(KeyId::storage_raw_max_age));
     p.disk.min_free_bytes = u(cfg.get_int(KeyId::storage_min_free_disk));
     p.disk.min_free_percent = cfg.get_float(KeyId::storage_min_free_disk_percent);
     p.cold_after_ms = u(cfg.get_int(KeyId::storage_cold_after));
@@ -49,7 +50,9 @@ WriterOptions fresh_options_from_config(const config::Config& cfg) {
     }
     const auto bs = cfg.get_int(KeyId::storage_block_size);
     o.block_raw = static_cast<uint32_t>(std::clamp<int64_t>(bs, kMinBlockTarget, kMaxBlockTarget));
-    o.index = IndexMode::at_seal;
+    // On append: the cost is spread over the store thread's appends instead of a burst at the
+    // seal that rereads the segment, and the open segment is searchable by its index.
+    o.index = IndexMode::on_append;
     return o;
 }
 
@@ -214,7 +217,14 @@ Result<void> Janitor::clean_orphans(uint64_t now_ms, JanitorReport& rep) {
     std::set<std::string> ids;
     for (const auto& s : *sessions) ids.insert(s.id);
     for (const auto& d : dirs) {
-        if (ids.count(platform::paths::to_utf8(d.filename()))) continue;
+        const std::string id = platform::paths::to_utf8(d.filename());
+        if (fs::exists(d / kManifestDeleting, ec)) {
+            // A deletion a crash cut short: finish it.
+            if (auto f = forget_session(catalog_, root_, id); !f) return Unexpected(f.error());
+            ++rep.empty_dirs;
+            continue;
+        }
+        if (ids.count(id)) continue;
         if (fs::is_empty(d, ec) && fs::remove(d, ec)) ++rep.empty_dirs;
     }
     return {};
@@ -231,7 +241,7 @@ Result<void> Janitor::apply_retention(uint64_t now_ms, JanitorReport& rep) {
         const auto it = st->sessions.find(s.session);
         const Policy pol = it != st->sessions.end() ? policy_for(it->second) : policy_;
         const uint64_t age = pol.max_age_of(s.info.kind);
-        if (s.info.ts_last + age < now_ms) {
+        if (add_sat(s.info.ts_last, age) < now_ms) {
             doomed.push_back(s);
             if (s.info.kind == Kind::raw && age < pol.max_age_ms) ++rep.raw_expired;
         }
@@ -243,7 +253,7 @@ Result<void> Janitor::apply_retention(uint64_t now_ms, JanitorReport& rep) {
     for (const auto& [id, s] : st->sessions) {
         if (!s.ended_ms || s.pinned) continue;
         const Policy pol = policy_for(s);
-        if (*s.ended_ms + pol.keep_closed_ms >= now_ms) continue;
+        if (add_sat(*s.ended_ms, pol.keep_closed_ms) >= now_ms) continue;
         std::vector<SegmentRow> mine;
         bool kept = false;
         for (const auto& seg : st->segs) {
@@ -509,6 +519,11 @@ Result<std::optional<SegmentRow>> rewrite_segments(Catalog& catalog, const fs::p
 
 Result<uint64_t> forget_session(Catalog& catalog, const fs::path& root, const std::string& id) {
     if (!valid_session_dir(id)) return make_error(Errc::invalid_argument, "bad session id");
+    {
+        std::error_code ec;
+        const fs::path dir = root / platform::paths::from_utf8(id);
+        if (fs::exists(dir / kSeriesManifest, ec)) fs::rename(dir / kSeriesManifest, dir / kManifestDeleting, ec);
+    }
     auto rows = catalog.segments(SegmentFilter{std::nullopt, std::nullopt, {id}, std::nullopt, {}, false});
     if (!rows) return Unexpected(rows.error());
     uint64_t bytes = 0;
@@ -556,7 +571,7 @@ void JanitorThread::run() {
             }
             if (catalog) {
                 const Policy pol = opt_.policy ? opt_.policy() : Policy{};
-                Janitor j(*catalog, root_, pol);
+                Janitor j(*catalog, root_, pol, opt_.per_session ? opt_.per_session() : Janitor::PolicyFor{});
                 j.set_stop(&stop_flag_);
                 auto rep = j.run_pass(now_unix_ms());
                 passes_.fetch_add(1);

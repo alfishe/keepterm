@@ -1,6 +1,9 @@
 #include "view/terminal/text_ops.h"
 
 #include <algorithm>
+#include <memory>
+
+#include <pcre2.h>
 
 #include "vt/terminal.h"
 
@@ -307,6 +310,125 @@ std::vector<Match> find_all(const LineSource& src, std::string_view query_utf8, 
             const SelPoint a = l.pos[at];
             const SelPoint b = l.pos[at + q.size() - 1];
             out.push_back(Match{a, SelPoint{b.line, end_col_of(src, b)}});
+        }
+        line = last + 1;
+    }
+    return out;
+}
+
+namespace {
+
+// The search's clock, asked inside a match by the automatic callouts (every pattern item): a
+// look at the time every 32 of them. One item scans at most a line (max_line_bytes).
+struct RegexClock {
+    std::chrono::steady_clock::time_point deadline;
+    uint32_t calls = 0;
+    bool late = false;
+    bool past() {
+        if (!late && std::chrono::steady_clock::now() >= deadline) late = true;
+        return late;
+    }
+};
+
+int regex_callout(pcre2_callout_block*, void* data) {
+    auto* c = static_cast<RegexClock*>(data);
+    if ((++c->calls & 31u) == 0 && c->past()) return PCRE2_ERROR_CALLOUT;
+    return 0;
+}
+
+template <class T, void (*Free)(T*)>
+struct PcreFree {
+    void operator()(T* p) const { Free(p); }
+};
+using CompileContext = std::unique_ptr<pcre2_compile_context, PcreFree<pcre2_compile_context, pcre2_compile_context_free>>;
+using MatchContext = std::unique_ptr<pcre2_match_context, PcreFree<pcre2_match_context, pcre2_match_context_free>>;
+using Code = std::unique_ptr<pcre2_code, PcreFree<pcre2_code, pcre2_code_free>>;
+using MatchData = std::unique_ptr<pcre2_match_data, PcreFree<pcre2_match_data, pcre2_match_data_free>>;
+
+}  // namespace
+
+Result<RegexFound> find_all_regex(const LineSource& src, std::string_view pattern, size_t limit, const RegexLimits& lim) {
+    RegexFound out;
+    if (pattern.empty()) return out;
+    if (pattern.size() > lim.max_pattern_bytes)
+        return make_error(Errc::invalid_argument, "the pattern is longer than " + std::to_string(lim.max_pattern_bytes) + " bytes");
+    CompileContext cc(pcre2_compile_context_create(nullptr));
+    MatchContext mc(pcre2_match_context_create(nullptr));
+    if (!cc || !mc) return make_error(Errc::unavailable, "out of memory");
+    pcre2_set_max_pattern_length(cc.get(), lim.max_pattern_bytes);
+    pcre2_set_parens_nest_limit(cc.get(), lim.max_nesting);
+    pcre2_set_max_pattern_compiled_length(cc.get(), lim.max_compiled_bytes);
+    int err = 0;
+    PCRE2_SIZE off = 0;
+    // \C could split a character; the callouts carry the clock.
+    const uint32_t opts = PCRE2_UTF | PCRE2_UCP | PCRE2_CASELESS | PCRE2_NEVER_BACKSLASH_C | PCRE2_AUTO_CALLOUT;
+    Code code(pcre2_compile(reinterpret_cast<PCRE2_SPTR>(pattern.data()), pattern.size(), opts, &err, &off, cc.get()));
+    if (!code) {
+        PCRE2_UCHAR msg[256];
+        if (pcre2_get_error_message(err, msg, sizeof msg) < 0) msg[0] = 0;
+        return make_error(Errc::invalid_argument, std::string(reinterpret_cast<const char*>(msg)) + " at " + std::to_string(off));
+    }
+    MatchData md(pcre2_match_data_create_from_pattern(code.get(), nullptr));
+    if (!md) return make_error(Errc::unavailable, "out of memory");
+    RegexClock clock{std::chrono::steady_clock::now() + lim.budget};
+    pcre2_set_match_limit(mc.get(), lim.match_steps);
+    pcre2_set_depth_limit(mc.get(), lim.depth);
+    pcre2_set_heap_limit(mc.get(), lim.heap_kib);
+    pcre2_set_callout(mc.get(), regex_callout, &clock);
+    if (src.end_line() == 0) return out;
+    std::string bytes;
+    std::vector<uint32_t> cp_at;   // byte offset -> index of the code point that starts there
+    uint64_t line = src.first_line();
+    auto stop = [&](const char* why) {
+        if (out.stopped.empty()) out.stopped = why;
+    };
+    while (line < src.end_line()) {
+        if (out.matches.size() >= limit) {
+            stop("the first matches only");
+            break;
+        }
+        if (clock.past()) {
+            stop("the pattern took too long");
+            break;
+        }
+        const uint64_t last = logical_end(src, line);
+        const Logical l = logical_text(src, line, last, false);
+        bytes.clear();
+        cp_at.clear();
+        size_t n = 0;   // the code points searched
+        for (; n < l.text.size(); ++n) {
+            const size_t before = bytes.size();
+            const char32_t c = l.text[n];
+            append_utf8(bytes, (c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF ? char32_t{0xFFFD} : c);
+            if (bytes.size() > lim.max_line_bytes) {
+                bytes.resize(before);
+                stop("long lines are searched in their first part");
+                break;
+            }
+            cp_at.insert(cp_at.end(), bytes.size() - before, static_cast<uint32_t>(n));
+        }
+        cp_at.push_back(static_cast<uint32_t>(n));
+        PCRE2_SIZE start = 0;
+        while (start <= bytes.size() && out.matches.size() < limit) {
+            const int rc = pcre2_match(code.get(), reinterpret_cast<PCRE2_SPTR>(bytes.data()), bytes.size(), start, 0, md.get(), mc.get());
+            if (rc == PCRE2_ERROR_NOMATCH) break;
+            if (rc < 0) {   // a limit (the clock, steps, depth, heap) or another failure: the next line
+                stop(rc == PCRE2_ERROR_CALLOUT                                    ? "the pattern took too long"
+                     : rc == PCRE2_ERROR_MATCHLIMIT || rc == PCRE2_ERROR_DEPTHLIMIT ? "the pattern is too complex for some lines"
+                     : rc == PCRE2_ERROR_HEAPLIMIT || rc == PCRE2_ERROR_NOMEMORY    ? "the pattern needs too much memory for some lines"
+                                                                                    : "the pattern failed on some lines");
+                break;
+            }
+            const PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md.get());
+            if (ov[0] > bytes.size() || ov[1] > bytes.size() || ov[1] <= ov[0]) {   // empty (or \K past the end): the next code point
+                start = std::max<PCRE2_SIZE>(start, std::min<PCRE2_SIZE>(ov[0], bytes.size())) + 1;
+                while (start < bytes.size() && (static_cast<unsigned char>(bytes[start]) & 0xC0) == 0x80) ++start;
+                continue;
+            }
+            const SelPoint a = l.pos[cp_at[ov[0]]];
+            const SelPoint b = l.pos[cp_at[ov[1]] - 1];
+            out.matches.push_back(Match{a, SelPoint{b.line, end_col_of(src, b)}});
+            start = ov[1];
         }
         line = last + 1;
     }

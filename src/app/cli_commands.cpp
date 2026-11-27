@@ -802,7 +802,7 @@ std::optional<int> cli_table(const std::string& ep, std::span<const std::string_
 const std::vector<CommandInfo>& command_catalog() {
     static const std::vector<CommandInfo> all = [] {
         std::vector<CommandInfo> out;
-        auto arg = [](std::string n, std::string t, std::string h, bool req = false) { return ArgInfo{std::move(n), std::move(t), std::move(h), req}; };
+        auto arg = [](std::string n, std::string t, std::string h, bool req = false) { return ArgInfo{std::move(n), std::move(t), std::move(h), req, "", false}; };
         const ArgInfo pane = arg("pane", "string", "pane id (a unique prefix works); default: the pane the agent runs in");
         for (const CmdSpec& c : specs()) {
             CommandInfo ci;
@@ -828,23 +828,154 @@ const std::vector<CommandInfo>& command_catalog() {
             }
             out.push_back(std::move(ci));
         }
-        out.push_back({"status", "keepterm status", "the app: version, pid, counts of projects, tabs and panes", {}, false});
-        out.push_back({"pane.list", "keepterm pane list", "every pane: id, project, tab, program, folder, the focused one", {}, false});
-        out.push_back({"pane.run", "keepterm pane run [--pane ID] [--no-submit] -- text",
+        auto wire = [&](std::string name, std::string cli, std::string help, std::vector<ArgInfo> args, bool pane_target) {
+            CommandInfo ci;
+            ci.name = std::move(name);
+            ci.cli = std::move(cli);
+            ci.help = std::move(help);
+            ci.args = std::move(args);
+            ci.pane_target = pane_target;
+            out.push_back(std::move(ci));
+        };
+        wire("status", "keepterm status", "the app: version, pid, counts of projects, tabs and panes", {}, false);
+        wire("pane.list", "keepterm pane list", "every pane: id, project, tab, program, folder, the focused one", {}, false);
+        wire("pane.run", "keepterm pane run [--pane ID] [--no-submit] -- text",
                        "type text into a pane's shell and press Enter (newlines become Enter too)",
                        {arg("text", "string", "the text to type", true), arg("submit", "boolean", "press Enter after the text (default true)"), pane},
-                       true});
-        out.push_back({"pane.dump", "keepterm pane dump [--pane ID] [--scrollback] [--lines N]", "the text on a pane's screen",
-                       {arg("scrollback", "boolean", "include the scrollback"), arg("lines", "integer", "only the last N lines"), pane}, true});
-        out.push_back({"session.kill", "keepterm session kill <id>", "end a session host",
-                       {arg("session", "string", "session id", true), arg("force", "boolean", "also when a program runs")}, false});
-        out.push_back({"command.run", "keepterm command run <id> [args...]", "run an app command by its id (the command palette's ids)",
+                       true);
+        wire("pane.dump", "keepterm pane dump [--pane ID] [--scrollback] [--lines N]", "the text on a pane's screen",
+                       {arg("scrollback", "boolean", "include the scrollback"), arg("lines", "integer", "only the last N lines"), pane}, true);
+        wire("session.kill", "keepterm session kill <id>", "end a session host",
+                       {arg("session", "string", "session id", true), arg("force", "boolean", "also when a program runs")}, false);
+        wire("command.run", "keepterm command run <id> [args...]", "run an app command by its id (the command palette's ids; `command.list` lists them)",
                        {arg("id", "string", "command id", true), arg("args", "array", "its arguments (strings)"), arg("force", "boolean", ""), pane},
-                       true});
-        out.push_back({"app.exit", "keepterm exit [--force]", "quit keepterm, ending every session (saved for the next start)",
-                       {arg("force", "boolean", "also when programs run")}, false});
-        out.push_back({"app.restart", "keepterm restart [--force]", "quit and start keepterm again", {arg("force", "boolean", "also when programs run")},
-                       false});
+                       true);
+        wire("app.exit", "keepterm exit [--force]", "quit keepterm, ending every session (saved for the next start)",
+                       {arg("force", "boolean", "also when programs run")}, false);
+        wire("app.restart", "keepterm restart [--force]", "quit and start keepterm again", {arg("force", "boolean", "also when programs run")},
+                       false);
+
+        // The commands the CLI runs without the app: MCP runs this executable with these words.
+        auto pos = [](std::string n, std::string t, std::string h, bool req = false) { return ArgInfo{std::move(n), std::move(t), std::move(h), req, "", false}; };
+        auto opt = [](std::string n, std::string t, std::string flag, std::string h) {
+            return ArgInfo{std::move(n), std::move(t), std::move(h), false, std::move(flag), false};
+        };
+        auto local = [&](std::string name, std::vector<std::string> words, std::string cli, std::string help, std::vector<ArgInfo> args,
+                         bool json, int timeout_ms = 60000) {
+            CommandInfo ci;
+            ci.name = std::move(name);
+            ci.cli = std::move(cli);
+            ci.help = std::move(help);
+            ci.args = std::move(args);
+            ci.local = std::move(words);
+            ci.json = json;
+            ci.timeout_ms = timeout_ms;
+            out.push_back(std::move(ci));
+        };
+        const ArgInfo sid = pos("session", "string", "session id (a unique prefix works); `session.list` or `pane.inspect` shows it", true);
+        local("session.list", {"session", "list"}, "keepterm session list [--orphans]",
+              "every session host of this user: id, state, pid, folder and the pane that shows it",
+              {opt("orphans", "boolean", "--orphans", "only live sessions no pane shows")}, true);
+        local("session.end_orphans", {"session", "orphans", "--kill"}, "keepterm session orphans --kill [--force]",
+              "end the live sessions no pane shows", {opt("force", "boolean", "--force", "also those that run a program")}, true);
+        local("session.info", {"session", "info"}, "keepterm session info <id>",
+              "a session: processes, folder, backend, shell, its agent with context and limits, history", {sid}, true);
+        local("session.dump", {"session", "dump"}, "keepterm session dump <id> [--scrollback]", "the text on a session's screen",
+              {sid, opt("scrollback", "boolean", "--scrollback", "include the scrollback")}, true);
+        local("session.send", {"session", "send"}, "keepterm session send <id> [--no-submit] -- text",
+              "type text into a session by its id (a pane's session: prefer pane.run)",
+              {sid, ArgInfo{"text", "string", "the text to type (newlines become Enter)", true, "--", false},
+               ArgInfo{"submit", "boolean", "press Enter after the text (default true)", false, "--no-submit", true}},
+              true);
+        local("layout.show", {"layout", "show"}, "keepterm layout show [--project P | --path DIR | --file F]",
+              "the project file (YAML layout) of a project: its path and text",
+              {opt("project", "string", "--project", "project id or name (default: the one in the window)"),
+               opt("path", "string", "--path", "the project's folder"), opt("file", "string", "--file", "a project file")},
+              true);
+        local("layout.validate", {"layout", "validate"}, "keepterm layout validate <file>", "check a project file (YAML layout)",
+              {pos("file", "string", "the project file", true)}, true);
+        local("command.list", {"--command", "list"}, "keepterm --command list [--os X]",
+              "every app command for `command.run`: id, title, category, key bindings, enabled",
+              {opt("os", "string", "--os", "macos, windows or linux: whose bindings (default: this OS)")}, true);
+        local("command.keymap", {"--command", "keymap"}, "keepterm --command keymap", "the default keymaps of every OS (Markdown)", {}, false);
+        local("resources", {"--resources"}, "keepterm --resources [--pid N] [--tree] [--cmdline] [--no-cpu]",
+              "memory and CPU of every live session with its process tree, or of one process",
+              {opt("pid", "integer", "--pid", "one process instead of the sessions"), opt("tree", "boolean", "--tree", "every process of the tree"),
+               opt("cmdline", "boolean", "--cmdline", "with command lines"), opt("no_cpu", "boolean", "--no-cpu", "skip the CPU sample (faster)")},
+              true);
+        local("history.du", {"--history", "du"}, "keepterm --history du", "disk use of the history store per session", {}, true);
+        local("history.search", {"--history", "search"},
+              "keepterm --history search <query> [--regex] [--case] [--since T] [--until T] [--session ID]... [--project P] [--kind K]... [--limit N]",
+              "search everything the sessions printed (the history store)",
+              {pos("query", "string", "the text to find", true), opt("regex", "boolean", "--regex", "query is a regular expression"),
+               opt("case", "boolean", "--case", "match case"),
+               opt("since", "string", "--since", "90m, 2h, 7d, 2w back from now; YYYY-MM-DD[THH:MM[:SS]]; Unix ms"),
+               opt("until", "string", "--until", "as since"), opt("session", "array", "--session", "only these session ids"),
+               opt("project", "string", "--project", "only this project"), opt("kind", "array", "--kind", "raw, text, commands, events"),
+               opt("limit", "integer", "--limit", "at most this many hits"), opt("explain", "boolean", "--explain", "show how the query ran")},
+              true);
+        local("history.forget", {"--history", "forget"}, "keepterm --history forget <session>", "delete a session's history",
+              {pos("session", "string", "session id", true)}, false);
+        const ArgInfo hid = pos("id", "string", "history id (a unique prefix works); `history.list` shows it", true);
+        local("history.list", {"--history", "list"},
+              "keepterm --history list [--since T] [--project P] [--agent A] [--tag T] [--state running|closed] [--limit N]",
+              "the sessions of the history, running and closed, last used first: title, project, folder, agents, tags, figures",
+              {opt("since", "string", "--since", "used since: 90m, 2h, 7d, 2w back from now; YYYY-MM-DD[THH:MM[:SS]]; Unix ms"),
+               opt("project", "string", "--project", "only this project (id or name)"), opt("agent", "string", "--agent", "only sessions that ran this agent"),
+               opt("tag", "string", "--tag", "only sessions with this tag"), opt("state", "string", "--state", "running or closed"),
+               opt("limit", "integer", "--limit", "at most this many")},
+              true);
+        local("history.show", {"--history", "show"}, "keepterm --history show <id>",
+              "one session of the history: its details, agent runs and commands", {hid}, true);
+        local("history.output", {"--history", "output"}, "keepterm --history output <id> [--format text|raw|asciicast] [-o FILE]",
+              "a session's stored output: its text lines, the raw stream with escape sequences, or an asciicast v2 recording",
+              {hid, opt("format", "string", "--format", "text (default), raw or asciicast"),
+               opt("output", "string", "--output", "write to this file instead of standard output")},
+              true);
+        local("history.restore", {"--history", "restore"}, "keepterm --history restore <id> [--resume-agent [N]] [--size COLSxROWS]",
+              "bring a closed session back in a new session host (its last screen, folder and title); prints the new session id",
+              {hid, opt("resume_agent", "integer", "--resume-agent", "also resume agent run N of `history.show` (its last without N)"),
+               opt("size", "string", "--size", "COLSxROWS of the new session (default 80x24)")},
+              false);
+        local("history.rename", {"--history", "rename"}, "keepterm --history rename <id> <title>", "set a session's title in the history",
+              {hid, pos("title", "string", "the new title (empty: back to the automatic one)", true)}, false);
+        local("history.tag", {"--history", "tag"}, "keepterm --history tag <id> <tag>...", "add tags to a session of the history",
+              {hid, pos("tags", "array", "the tags", true)}, false);
+        local("history.untag", {"--history", "untag"}, "keepterm --history untag <id> <tag>...", "remove tags from a session of the history",
+              {hid, pos("tags", "array", "the tags", true)}, false);
+        local("history.pin", {"--history", "pin"}, "keepterm --history pin <id>", "keep a session of the history from retention", {hid}, false);
+        local("history.unpin", {"--history", "unpin"}, "keepterm --history unpin <id>", "let retention delete a session of the history again",
+              {hid}, false);
+        local("history.delete", {"--history", "delete"}, "keepterm --history delete <id>... [--force]",
+              "delete closed sessions from the history: their output, screen, commands and folders (without force: what would go)",
+              {pos("ids", "array", "history ids", true), opt("force", "boolean", "--force", "delete (else only report)")}, false);
+        local("history.backfill", {"--history", "backfill"}, "keepterm --history backfill <session> [--journal FILE] [--project P] [--no-raw]",
+              "import a session's journal into the history store",
+              {pos("session", "string", "session id", true), opt("journal", "string", "--journal", "the journal file"),
+               opt("project", "string", "--project", "the project to file it under"), opt("no_raw", "boolean", "--no-raw", "text only")},
+              false, 300000);
+        local("history.janitor", {"--history", "janitor"}, "keepterm --history janitor", "run retention and compaction of the history store now", {},
+              false, 300000);
+        local("agent.limits", {"--agent-limits"}, "keepterm --agent-limits [claude]", "the agent's usage limits: used percent, window, reset time",
+              {pos("agent", "string", "the agent (default claude)")}, false, 90000);
+        local("agent.hook", {"--agent-hook"}, "keepterm --agent-hook install|uninstall|status [claude]",
+              "the agent's statusLine hook that relays exact context figures",
+              {pos("action", "string", "install, uninstall or status", true), pos("agent", "string", "the agent (default claude)")}, false);
+        const ArgInfo profile = opt("profile", "string", "--profile", "config profile (default: the running one)");
+        local("config.dump", {"--config", "dump"}, "keepterm --config dump [--defaults] [--no-origins] [--file F] [--set K=V]...",
+              "the effective config with where each value comes from",
+              {opt("defaults", "boolean", "--defaults", "only the defaults"), opt("no_origins", "boolean", "--no-origins", "without origins"),
+               profile, opt("file", "string", "--file", "this config file"), opt("set", "array", "--set", "KEY=VALUE overrides")},
+              false);
+        local("config.check", {"--config", "check"}, "keepterm --config check [PATH]", "check a config file: errors and warnings",
+              {pos("path", "string", "the file (default: the user's config)"), profile}, false);
+        local("config.path", {"--config", "path"}, "keepterm --config path", "the config files that are read", {profile}, false);
+        local("theme.list", {"--theme", "list"}, "keepterm --theme list [--all]", "the themes: built-in, collection and user files",
+              {opt("all", "boolean", "--all", "every theme"), profile}, false);
+        local("theme.show", {"--theme", "show"}, "keepterm --theme show <name> [--toml]", "a theme's colors",
+              {pos("name", "string", "theme name", true), opt("toml", "boolean", "--toml", "as a TOML theme file"), profile}, false);
+        local("font.list", {"--font", "list"}, "keepterm --font list [--all]", "monospace font families (all: every family)",
+              {opt("all", "boolean", "--all", "every family")}, false);
         return out;
     }();
     return all;

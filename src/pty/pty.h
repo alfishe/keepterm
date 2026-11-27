@@ -116,6 +116,9 @@ public:
     virtual BackendCaps caps() const = 0;
     virtual const ContainmentInfo& containment() const = 0;
     virtual Result<std::vector<Pid>> process_ids() const = 0;
+    // Safe alongside write, resize, signal and the reads (not close): the host asks it without
+    // the lock its other calls take, so a slow answer (ConPTY attaches to the console) never
+    // holds up a kill.
     virtual Result<Pid> foreground_pid() const = 0;
 };
 

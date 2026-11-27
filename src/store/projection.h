@@ -60,7 +60,8 @@ private:
 class ScrollbackTap {
 public:
     explicit ScrollbackTap(LineSink& sink) : sink_(sink) {}
-    // Starts after the rows already in `t`'s scrollback (default: from absolute row 0).
+    // Starts after the rows already in `t`'s scrollback (default: from absolute row 0), from the
+    // head of a soft-wrapped line whose tail is still to come.
     void attach(const vt::Terminal& t);
     // Emits the logical lines completed by rows that entered the scrollback since the last call,
     // at most `max_rows` rows per call (the session host bounds the time it holds the terminal

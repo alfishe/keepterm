@@ -9,7 +9,7 @@ namespace kt::ui {
 
 namespace {
 
-constexpr float kRowH = 30, kHeaderH = 26, kMaxListH = 380, kWidth = 640;
+constexpr float kRowH = 30, kDetailRowH = 48, kHeaderH = 26, kMaxListH = 380, kWidth = 640;
 
 float px_round(float v, float scale) { return std::round(v * scale) / scale; }
 
@@ -39,8 +39,9 @@ public:
                 y += kHeaderH;
             }
             section = rows_[i].section;
-            entries_.push_back(Entry{false, i, {}, y, kRowH});
-            y += kRowH;
+            const float h = rows_[i].detail.empty() ? kRowH : kDetailRowH;
+            entries_.push_back(Entry{false, i, {}, y, h});
+            y += h;
         }
         content_h_ = y;
         offset_ = 0;
@@ -109,6 +110,7 @@ public:
             }
             const PaletteRow& r = rows_[e.row];
             const Rect row{6, y, b.w - 12, e.h};
+            const float lh = r.detail.empty() ? e.h : kRowH;   // the first line
             const bool sel = selected_ && *selected_ == e.row;
             if (sel) p.dl.round_rect(row, t.radius_control, t.selection);
             else if (hover_ && *hover_ == e.row) p.dl.round_rect(row, t.radius_control, t.fg.with_alpha(0.05f));
@@ -116,26 +118,26 @@ public:
             float x = 16;
             const Icon icon = r.checked ? Icon::check : r.icon;
             if (icon != Icon::none) {
-                p.dl.icon(icon, 14, {x, px_round(y + (e.h - 14) / 2, p.scale)}, r.enabled ? t.fg_muted : t.fg_dim);
+                p.dl.icon(icon, 14, {x, px_round(y + (lh - 14) / 2, p.scale)}, r.enabled ? t.fg_muted : t.fg_dim);
             }
             x += 22;
             // Right side first: key caps or the scope chevron, then the title gets the rest.
             float right = row.right() - 10;
             if (r.opens_scope) {
-                p.dl.icon(Icon::chevron_right, 12, {right - 12, px_round(y + (e.h - 12) / 2, p.scale)}, t.fg_dim);
+                p.dl.icon(Icon::chevron_right, 12, {right - 12, px_round(y + (lh - 12) / 2, p.scale)}, t.fg_dim);
                 right -= 18;
             }
             if (!r.keys.empty()) {
                 auto kr = p.text.shape(r.keys, key_role, p.scale);
                 const float kw = kr->width() + 10, kh = 18;
-                const Rect cap{right - kw, px_round(y + (e.h - kh) / 2, p.scale), kw, kh};
+                const Rect cap{right - kw, px_round(y + (lh - kh) / 2, p.scale), kw, kh};
                 p.dl.round_rect(cap, t.radius_keycap, t.fg.with_alpha(0.06f), 1, t.border);
                 p.dl.text(kr, {cap.x + 5, px_round(cap.y + (kh - kr->height()) / 2 + kr->ascent(), p.scale)}, t.fg_muted);
                 right = cap.x - 10;
             }
             const float avail = std::max(0.0f, right - x);
             auto tr = p.text.ellipsize(r.title, title_role, p.scale, avail);
-            const float base = px_round(y + (e.h - tr->height()) / 2 + tr->ascent(), p.scale);
+            const float base = px_round(y + (lh - tr->height()) / 2 + tr->ascent(), p.scale);
             // Matched characters: a soft accent behind the glyphs.
             if (!r.highlights.empty() && r.enabled) {
                 for (uint32_t h : r.highlights) {
@@ -153,7 +155,12 @@ public:
             const std::string& sub = r.enabled ? r.subtitle : (r.disabled_reason.empty() ? r.subtitle : r.disabled_reason);
             if (!sub.empty() && tr->width() + 16 < avail) {
                 auto sr = p.text.ellipsize(sub, sub_role, p.scale, avail - tr->width() - 12);
-                p.dl.text(sr, {x + tr->width() + 10, px_round(y + (e.h - sr->height()) / 2 + sr->ascent(), p.scale)}, t.fg_dim);
+                p.dl.text(sr, {x + tr->width() + 10, px_round(y + (lh - sr->height()) / 2 + sr->ascent(), p.scale)}, t.fg_dim);
+            }
+            if (!r.detail.empty()) {
+                const FontRole mono = role_for(t, TextStyle::mono_small);
+                paint_marked(p, r.detail, r.detail_marks, mono, x, px_round(y + kRowH - 6, p.scale), row.right() - 10 - x,
+                             r.enabled ? t.fg_muted : t.fg_dim);
             }
         }
         // Scroll indicator.

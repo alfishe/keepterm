@@ -151,6 +151,7 @@ public:
     Result<void> attach(const platform::NativeSurface&, PxSize size, float scale) override;
     Result<void> attach_offscreen(PxSize size, float scale) override;
     void resize(PxSize size, float scale) override;
+    float scale() const { return scale_; }
     void detach() override;
     Result<TextureId> create_texture(const TextureDesc&) override;
     void update_texture(TextureId, IRect region, const void* pixels, uint32_t stride) override;

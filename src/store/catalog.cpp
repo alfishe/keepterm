@@ -547,11 +547,18 @@ Result<int64_t> Catalog::add_command(const CommandRow& c) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+Result<void> Catalog::finish_command(int64_t id, uint64_t ended_ms, std::optional<int> exit_code) {
+    std::lock_guard lk(mu_);
+    Stmt st(db_, "UPDATE commands SET ended_ms=?, exit_code=? WHERE id=?");
+    st.bind(1, ended_ms).bind_opt(2, exit_code).bind(3, id);
+    return run(st, "finish command");
+}
+
 Result<std::vector<CommandRow>> Catalog::commands(const std::string& session) {
     std::lock_guard lk(mu_);
     Stmt st(db_,
             "SELECT id, session_id, started_ms, ended_ms, exit_code, cwd, command, segment_id, block, seq FROM commands "
-            "WHERE session_id=? ORDER BY started_ms");
+            "WHERE session_id=? ORDER BY started_ms, id");
     st.bind(1, session);
     if (!st.ok()) return st.error("commands");
     std::vector<CommandRow> out;

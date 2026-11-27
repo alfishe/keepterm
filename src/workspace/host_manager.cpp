@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "base/log.h"
+#include "session/archive.h"
 #include "session/client.h"
 #include "session/os.h"
 #include "session/registry.h"
@@ -179,15 +180,32 @@ private:
             session::proto::Kill k;
             k.mode = mode;
             auto r = session::request_kill(d->record.endpoint, k);
+            // KillTree: the host archives its session before it exits.
+            const int waits = mode == session::proto::KillMode::KillTree ? 200 : 40;
             if (r && r->ok)
-                for (int i = 0; i < 40 && running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                for (int i = 0; i < waits && running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         if (running()) {
             if (auto r = session::os::kill_process(host.pid, host.start_time); !r) return false;
             for (int i = 0; i < 20 && running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         if (d->state != session::HostState::Unresponsive) reg.remove(id);
-        return !running();
+        if (running()) return false;
+        // A host that died or was ended before it archived leaves its folder: archive it here.
+        if (mode == session::proto::KillMode::KillTree) archive_dead(*paths, id, "killed");
+        return true;
+    }
+
+    static void archive_dead(const session::os::Paths& paths, const session::SessionId& id, const char* reason) {
+        const std::string dir = session::os::join(paths.state_sessions, id.str());
+        if (!session::os::is_dir(dir)) return;
+        session::ArchiveOptions ao;
+        ao.state = paths.state;
+        ao.close_reason = reason;
+        ao.busy_wait = std::chrono::seconds(5);  // the killed host may hold its locks a moment longer
+        auto r = session::archive_session(dir, ao);
+        if (!r) kt::log::warn("workspace", "archive of " + id.str() + ": " + r.error().what);
+        else if (r->outcome == session::ArchiveOutcome::busy) kt::log::warn("workspace", "archive of " + id.str() + ": busy");
     }
 
     static constexpr std::size_t kMaxWorkers = 8;

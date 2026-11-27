@@ -65,6 +65,14 @@ void Label::set_text(std::string t) {
     invalidate_layout();
 }
 
+void Label::on_text_metrics_changed() {
+    full_.reset();
+    shown_.reset();
+    lines_.clear();
+    shown_w_ = -1;
+    Widget::on_text_metrics_changed();
+}
+
 void Label::set_text_style(TextStyle s) {
     if (s == style_) return;
     style_ = s;
@@ -935,7 +943,8 @@ EventResult ListView::on_pointer(PointerEvent& e) {
         }
         if (e.button == platform::MouseButton::left) {
             set_selected(*at, false);
-            if (on_select) on_select(*at);
+            if (on_select_mods) on_select_mods(*at, e.mods);
+            else if (on_select) on_select(*at);
             if (e.clicks >= 2 && on_activate) on_activate(*at);
             return EventResult::Handled;
         }
@@ -963,7 +972,8 @@ EventResult ListView::on_key(const KeyEvent& k) {
         default: return EventResult::Ignored;
     }
     set_selected(next);
-    if (on_select && next) on_select(*next);
+    if (next && on_select_mods) on_select_mods(*next, static_cast<uint16_t>(k.mods & platform::mod_shift));
+    else if (on_select && next) on_select(*next);
     return EventResult::Handled;
 }
 
@@ -1095,6 +1105,36 @@ void Sparkline::paint(PaintContext& p) const {
         const float w = std::max(px1, col - (col >= 3 ? px1 : 0));
         p.dl.rect(Rect{px_round(x, p.scale), b.h - h, w, h}, c.with_alpha(i + 1 == n ? 0.95f : 0.6f));
     }
+}
+
+// Draws a text with its matches on a highlight, at most max_w wide; a long text is cut in front
+// so that the first match shows. Returns the drawn width.
+float paint_marked(PaintContext& p, std::string text, std::vector<std::pair<size_t, size_t>> marks, FontRole role, float x,
+                   float top, float max_w, Color fg) {
+    for (char& ch : text)
+        if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+    if (max_w < 10) return 0;
+    if (!marks.empty() && marks.front().first > 24 && p.text.shape(text, role, p.scale)->width() > max_w) {
+        size_t start = marks.front().first - 20;
+        while (start > 0 && (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) --start;
+        static const std::string kEllipsis = "\xE2\x80\xA6";
+        text = kEllipsis + text.substr(start);
+        std::vector<std::pair<size_t, size_t>> moved;
+        for (auto [off, len] : marks)
+            if (off >= start) moved.emplace_back(off - start + kEllipsis.size(), len);
+        marks = std::move(moved);
+    }
+    auto run = p.text.ellipsize(text, role, p.scale, max_w);
+    const float y = std::round(top + run->ascent());
+    for (auto [off, len] : marks) {
+        if (off + len > text.size()) continue;
+        const float x0 = p.text.shape(std::string_view(text).substr(0, off), role, p.scale)->width();
+        if (x0 >= run->width()) break;
+        const float w = std::min(p.text.shape(std::string_view(text).substr(off, len), role, p.scale)->width(), run->width() - x0);
+        p.dl.round_rect(Rect{x + x0 - 1, top, w + 2, run->height()}, 2, p.theme.warning.with_alpha(0.35f));
+    }
+    p.dl.text(run, {x, y}, fg);
+    return run->width();
 }
 
 }  // namespace kt::ui

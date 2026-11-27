@@ -106,6 +106,7 @@ Shape shape_of(Icon i) {
             poly(s, {{8.5f, 3.5f}, {15.5f, 3.5f}, {15, 9}, {18, 13}, {6, 13}, {9, 9}}, true);
             s.push_back(S(12, 13, 12, 20.5f));
             break;
+        case Icon::history: s = {C(12, 12, 8.5f), S(12, 7, 12, 12), S(12, 12, 15.5f, 14)}; break;
         case Icon::more: s = {D(6, 12, 1.7f), D(12, 12, 1.7f), D(18, 12, 1.7f)}; break;
         case Icon::copy:
             s.push_back(B(8, 8, 12, 12, 2));
@@ -170,7 +171,7 @@ std::string_view icon_name(Icon i) {
         "none", "folder", "terminal", "plus", "close", "chevron_right", "chevron_down", "sidebar", "split_right",
         "split_down", "zoom", "unzoom", "memory", "cpu", "gear", "search", "dot", "agent", "spinner", "check",
         "alert", "storage", "bell", "pin", "more", "copy", "menu", "minimize", "maximize", "palette", "trash",
-        "edit", "keyboard", "info"};
+        "edit", "keyboard", "info", "history"};
     static_assert(std::size(names) == static_cast<size_t>(Icon::count_));
     const auto k = static_cast<size_t>(i);
     return k < std::size(names) ? names[k] : "none";

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iterator>
@@ -349,6 +350,7 @@ std::unique_ptr<Widget> SettingsController::build_pane(const settings::PaneDef& 
         case settings::Special::Keymaps: add_keymaps(*page); break;
         case settings::Special::Agents: add_agents(*page); break;
         case settings::Special::Advanced: add_advanced(*page); break;
+        case settings::Special::History: add_history(*page); break;
         default: break;
     }
     return page;
@@ -418,6 +420,44 @@ std::unique_ptr<FormRow> SettingsController::build_row(const RowDef& r) {
                 b->show = [cp, index_of](const Value& v) { cp->set_selected(index_of(v)); };
                 ctl = std::move(c);
             }
+            break;
+        }
+        case Control::Preset: {
+            // The fixed values of `options` that parse for the key, in their order.
+            auto values = std::make_shared<std::vector<std::pair<Value, std::string>>>();
+            for (std::string_view o = r.options; !o.empty();) {
+                const size_t bar = o.find('|');
+                const std::string_view item = o.substr(0, bar);
+                const size_t eq = item.find('=');
+                if (eq != std::string_view::npos) {
+                    if (auto v = config::parse_input(s, std::string(item.substr(0, eq)))) values->emplace_back(*v, std::string(item.substr(eq + 1)));
+                }
+                if (bar == std::string_view::npos) break;
+                o.remove_prefix(bar + 1);
+            }
+            auto shown = std::make_shared<std::vector<Value>>();
+            auto c = std::make_unique<Dropdown>(std::vector<DropdownOption>{}, size_t{0}, "control");
+            Dropdown* cp = c.get();
+            c->on_change = [this, k, shown](size_t i) {
+                if (i < shown->size()) commit_choice(k, (*shown)[i]);
+            };
+            b->show = [cp, values, shown, sp = &s](const Value& v) {
+                shown->clear();
+                std::vector<DropdownOption> opts;
+                size_t sel = SIZE_MAX;
+                for (const auto& [val, label] : *values) {
+                    if (val == v) sel = opts.size();
+                    shown->push_back(val);
+                    opts.push_back({label, val == sp->default_value ? "Default" : "", std::nullopt});
+                }
+                if (sel == SIZE_MAX) {
+                    sel = opts.size();
+                    shown->push_back(v);
+                    opts.push_back({"Custom: " + config::input_text(v, sp->type), "", std::nullopt});
+                }
+                cp->set_options(std::move(opts), sel);
+            };
+            ctl = std::move(c);
             break;
         }
         case Control::FontFamily: {
@@ -1151,6 +1191,118 @@ void SettingsController::add_storage(Widget& page) {
         sg->add_row(std::make_unique<FormRow>(std::move(title), std::move(desc), std::move(line), "session[" + s.id + "]"));
     }
     page.add_child(std::move(sg));
+}
+
+// ---------------------------------------------------------------- History
+
+namespace {
+
+std::string size_text(uint64_t b) {
+    static constexpr const char* kUnits[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    double v = static_cast<double>(b);
+    size_t unit = 0;
+    while (v >= 1024 && unit + 1 < std::size(kUnits)) {
+        v /= 1024;
+        ++unit;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, unit == 0 || v >= 100 ? "%.0f %s" : "%.1f %s", v, kUnits[unit]);
+    return buf;
+}
+
+std::string sessions_text(size_t n) { return std::to_string(n) + (n == 1 ? " closed session" : " closed sessions"); }
+
+void failure_toast(Window* w, const std::string& what) {
+    if (w) show_toast(*w, ToastSpec{what, {}, Icon::alert, Tone::failure});
+}
+
+}  // namespace
+
+void SettingsController::commit_choice(KeyId k, const Value& v) {
+    Window* w = view_ ? view_->window() : nullptr;
+    if (k != KeyId::storage_keep_closed || !env_.history_due || !w) {
+        (void)set_value(k, v);
+        return;
+    }
+    const auto* ms = std::get_if<std::int64_t>(&v);
+    HistoryDeletion d = env_.history_due(ms ? *ms : 0);
+    if (d.ids.empty()) {
+        (void)set_value(k, v);
+        return;
+    }
+    // Nothing is deleted before the confirmation; Cancel shows the old value again.
+    DialogSpec dlg;
+    dlg.title = "Delete " + sessions_text(d.ids.size()) + "?";
+    dlg.message = "This deletes " + sessions_text(d.ids.size()) + " (" + size_text(d.stored_bytes) +
+                  ") now. Pinned sessions stay.";
+    dlg.buttons.push_back({"Cancel", [this] { update_rows(); }, Button::Kind::secondary, false, true});
+    dlg.buttons.push_back({"Delete", [this, k, v, ids = std::move(d.ids)] {
+                               if (!set_value(k, v)) return;
+                               if (env_.delete_history) {
+                                   if (auto r = env_.delete_history(ids); !r) failure_toast(view_ ? view_->window() : nullptr, r.error().what);
+                               }
+                               rebuild_later();
+                           },
+                           Button::Kind::danger, true, false});
+    show_dialog(*w, std::move(dlg));
+}
+
+void SettingsController::add_history(Widget& page) {
+    if (!env_.history_summary) return;
+    auto g = std::make_unique<FormGroup>("Store", "store");
+    auto sum = env_.history_summary();
+    if (!sum) {
+        g->add_row(std::make_unique<FormRow>("Session history", sum.error().what, nullptr, "error"));
+        page.add_child(std::move(g));
+        return;
+    }
+    std::string figures = size_text(sum->raw_bytes) + " of output in " + size_text(sum->stored_bytes) + " \xC2\xB7 " +
+                          std::to_string(sum->sessions) + (sum->sessions == 1 ? " session" : " sessions");
+    if (sum->pinned) figures += " \xC2\xB7 " + std::to_string(sum->pinned) + " pinned";
+    g->add_row(std::make_unique<FormRow>("Recorded", "", std::make_unique<Label>(figures, TextStyle::small, Tone::muted, "control"), "figures"));
+    auto line = row("actions", 6);
+    if (env_.open_session_history) {
+        line->add(std::make_unique<Button>("Open Session History", [this] { env_.open_session_history(); }, Button::Kind::secondary, "open"));
+    }
+    if (env_.history_closed_before && env_.delete_history) {
+        line->add(std::make_unique<Button>("Delete History\xE2\x80\xA6", [this] { delete_history_dialog(); }, Button::Kind::danger, "delete"));
+    }
+    g->add_row(std::make_unique<FormRow>("", "", std::move(line), "buttons"));
+    page.add_child(std::move(g));
+}
+
+void SettingsController::delete_history_dialog() {
+    Window* w = view_ ? view_->window() : nullptr;
+    if (!w) return;
+    const auto now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    constexpr uint64_t kMonth = 30ull * 24 * 3600 * 1000;
+    HistoryDeletion old = env_.history_closed_before(now > kMonth ? now - kMonth : 1);
+    HistoryDeletion all = env_.history_closed_before(0);
+    DialogSpec dlg;
+    dlg.title = "Delete History";
+    if (all.ids.empty()) {
+        dlg.message = "There are no closed sessions to delete. Running and pinned sessions are never deleted here.";
+        dlg.buttons.push_back({"OK", {}, Button::Kind::primary, true, true});
+        show_dialog(*w, std::move(dlg));
+        return;
+    }
+    dlg.message = "Closed more than a month ago: " + sessions_text(old.ids.size()) + " (" + size_text(old.stored_bytes) + ").\n" +
+                  "All closed: " + sessions_text(all.ids.size()) + " (" + size_text(all.stored_bytes) + ").\n" +
+                  "Running and pinned sessions stay. This cannot be undone.";
+    auto del = [this](std::vector<std::string> ids) {
+        return [this, ids = std::move(ids)] {
+            if (auto r = env_.delete_history(ids); !r) failure_toast(view_ ? view_->window() : nullptr, r.error().what);
+            rebuild_later();
+        };
+    };
+    dlg.buttons.push_back({"Cancel", {}, Button::Kind::secondary, false, true});
+    if (!old.ids.empty() && old.ids.size() < all.ids.size()) {
+        dlg.buttons.push_back({"Older Than a Month", del(std::move(old.ids)), Button::Kind::danger, false, false});
+    }
+    dlg.buttons.push_back({"All Closed", del(std::move(all.ids)), Button::Kind::danger, false, false});
+    dlg.width = 440;
+    show_dialog(*w, std::move(dlg));
 }
 
 // ---------------------------------------------------------------- Advanced

@@ -184,11 +184,16 @@ public:
 };
 
 // Where the view stands in the scrollback, for the overlay scrollbar.
+inline constexpr uint16_t kScrollMarks = 1024;   // the resolution of `marks`
 struct ScrollMetrics {
     uint64_t history = 0;   // lines above the live screen (0 on the alternate screen)
     uint32_t rows = 0;      // the screen
     uint32_t offset = 0;    // rows the view is scrolled up from the live screen
     uint32_t fg = 0xFFFFFF;  // the terminal theme's foreground (0xRRGGBB): the thumb's color
+    // Find matches, ascending, as positions 0..kScrollMarks-1 over scrollback + screen; the bar
+    // shows them as ticks while a search is open.
+    std::vector<uint16_t> marks;
+    std::optional<uint16_t> current_mark;
 };
 
 // A terminal pane's renderer and input sink, implemented by the application (one per pane).

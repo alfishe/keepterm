@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -15,6 +16,12 @@
 #include "commands/keys.h"
 
 namespace kt::commands {
+
+// A line of a session's stored output: where its output viewer opens (session/history_output.h).
+struct HistoryLine {
+    std::uint64_t seq = 0;
+    std::string text;
+};
 
 using Status = Expected<void, Error>;
 
@@ -136,6 +143,22 @@ public:
     virtual Status import_workspace() { return no("import workspace"); }
     // The sessions overview: every pane per project and the live sessions no pane shows.
     virtual Status show_sessions() { return no("sessions overview"); }
+    // The Session History window: every session, live and closed.
+    virtual Status show_session_history() { return no("session history"); }
+    // The window with this session selected.
+    virtual Status reveal_in_history(std::string_view history_id) { (void)history_id; return no("session history"); }
+    // The main action of a history session: Show (live), Attach (background), Restore (closed).
+    virtual Status open_history_session(std::string_view history_id) { (void)history_id; return no("session history"); }
+    // An output line found in the history (`line`: its stream offset and text, when known), or a
+    // command of a closed session (its offset and command line): a running session's pane with
+    // the find bar on `query`; a closed session's stored output in a viewer tab, at that line.
+    virtual Status open_history_output(std::string_view history_id, std::string_view query,
+                                       const std::optional<HistoryLine>& line) {
+        (void)history_id;
+        (void)query;
+        (void)line;
+        return no("session history");
+    }
     virtual Status select_project_relative(int delta) { (void)delta; return no("project cycling"); }
 
     // ---- window and view

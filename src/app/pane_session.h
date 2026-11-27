@@ -85,6 +85,22 @@ public:
     void set_cursor_defaults(vt::CursorShape shape, bool blink);
     view::TerminalView& view() { return *tv_; }
 
+    // Static text instead of a program (the output viewer): a terminal of its own, without a
+    // link, holding every line in its scrollback; the cursor is hidden. A `prompt` line gets the
+    // OSC 133 prompt mark (Jump to Previous / Next Prompt stop there), a `dim` one is drawn
+    // faint. Controls in the text are shown as spaces. Returns the absolute line `target` starts
+    // at. Call read_only too: typing goes nowhere.
+    struct StaticLine {
+        std::string text;
+        bool prompt = false, dim = false;
+    };
+    std::optional<uint64_t> show_lines(const std::vector<StaticLine>& lines, std::optional<std::size_t> target);
+    // Find, with the current match the first one at or after absolute line `line` (the line a
+    // viewer opened at) and scrolled to it.
+    size_t find_at(const std::string& query, uint64_t line);
+    // Scrolls absolute line `line` into the middle of the view.
+    void reveal_line(uint64_t line);
+
     // pane.read_only: typing, paste, IME text and mouse reports are dropped; selection, copy,
     // scrolling and find still work. Terminal replies (DA, focus reports) still go out.
     void set_read_only(bool on) { read_only_ = on; }
@@ -107,12 +123,19 @@ public:
     std::string selection_text() const;
     void select_all();
     void clear_selection();
-    // Find: literal, case-insensitive; returns the match count. `step` moves the current
-    // match (+1 newer, -1 older) and scrolls it into view.
-    size_t find(const std::string& query);
+    // Find: literal or (`regex`) a PCRE2 pattern, case-insensitive; returns the match count, 0
+    // with find_error() set for an invalid pattern. `step` moves the current match (+1 newer, -1
+    // older) and scrolls it into view.
+    size_t find(const std::string& query, bool regex = false);
+    const std::string& find_error() const { return find_error_; }
+    // Why the matches are not all of them ("" when they are): a limit of the search.
+    const std::string& find_partial() const { return find_partial_; }
     void find_step(int delta);
     void end_find();
     std::optional<size_t> find_current() const { return cur_match_; }
+    std::optional<view::Match> current_match() const {
+        return cur_match_ && *cur_match_ < matches_.size() ? std::optional<view::Match>(matches_[*cur_match_]) : std::nullopt;
+    }
     size_t find_count() const { return matches_.size(); }
     // Copy mode: vim keys over the scrollback; y / Enter copy, q / Esc leave.
     void toggle_copy_mode();
@@ -228,6 +251,13 @@ private:
     std::optional<view::SelPoint> hover_at_;
     std::vector<view::Match> matches_;
     std::optional<size_t> cur_match_;
+    std::string find_query_;   // what matches_ are of
+    bool find_regex_ = false;
+    std::string find_error_, find_partial_;
+    std::vector<view::Match> search(const std::string& query);   // term_mu_ held; sets find_error_
+    // A resize rewrapped the lines: the matches' cells moved. Finds them again, the current one
+    // staying current (a rewrap keeps their order), and shows it.
+    void refind_after_reflow();
     view::CopyMode copy_;
 
     std::atomic<bool> wake_posted_{false}, retry_posted_{false};

@@ -70,6 +70,28 @@ bool pick_folder(void* native_view, const std::string& title, const std::string&
     return true;
 }
 
+bool pick_save_file(void* native_view, const std::string& title, const std::string& folder, const std::string& name,
+                    std::function<void(std::string)> done, const Post&) {
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.canCreateDirectories = YES;
+    panel.message = [NSString stringWithUTF8String:title.c_str()];
+    panel.nameFieldStringValue = [NSString stringWithUTF8String:name.c_str()];
+    if (!folder.empty())
+        panel.directoryURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:folder.c_str()] isDirectory:YES];
+    auto finish = [panel, done = std::move(done)](NSModalResponse r) {
+        if (r != NSModalResponseOK || !panel.URL) return;
+        const char* p = panel.URL.path.UTF8String;
+        if (p) done(std::string(p));
+    };
+    NSView* view = (__bridge NSView*)native_view;
+    if (view.window) {
+        [panel beginSheetModalForWindow:view.window completionHandler:^(NSModalResponse r) { finish(r); }];
+    } else {
+        [panel beginWithCompletionHandler:^(NSModalResponse r) { finish(r); }];
+    }
+    return true;
+}
+
 void set_badge(int count) {
     NSString* label = count > 0 ? [NSString stringWithFormat:@"%d", count] : nil;
     [[NSApp dockTile] setBadgeLabel:label];

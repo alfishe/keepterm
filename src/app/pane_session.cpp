@@ -244,9 +244,12 @@ void PaneSession::relayout(bool force_link) {
     if (g == grid_ && !force_link) return;
     grid_ = g;
     if (!mirror_) {
-        std::lock_guard lk(term_mu_);
-        term_->resize(g);
-        term_->publish();
+        {
+            std::lock_guard lk(term_mu_);
+            term_->resize(g);
+            term_->publish();
+        }
+        refind_after_reflow();
     }
     std::lock_guard lk(link_mu_);
     if (link_) link_->resize(pty_size(g));
@@ -479,11 +482,32 @@ void PaneSession::clear_selection() {
     changed();
 }
 
-size_t PaneSession::find(const std::string& query) {
+std::vector<view::Match> PaneSession::search(const std::string& query) {
+    constexpr size_t kLimit = 10000;
+    find_error_.clear();
+    find_partial_.clear();
+    if (query.empty()) return {};
+    if (!find_regex_) {
+        auto m = view::find_all(view::TerminalLines(*term_), query, kLimit);
+        if (m.size() >= kLimit) find_partial_ = "the first matches only";
+        return m;
+    }
+    auto r = view::find_all_regex(view::TerminalLines(*term_), query, kLimit);
+    if (!r) {
+        find_error_ = r.error().what;
+        return {};
+    }
+    find_partial_ = std::move(r->stopped);
+    return std::move(r->matches);
+}
+
+size_t PaneSession::find(const std::string& query, bool regex) {
     {
         std::lock_guard lk(term_mu_);
         if (!term_) return 0;
-        matches_ = query.empty() ? std::vector<view::Match>{} : view::find_all(view::TerminalLines(*term_), query);
+        find_regex_ = regex;
+        matches_ = search(query);
+        find_query_ = query;
         cur_match_.reset();
         if (!matches_.empty()) {
             // The newest match at or above the viewport bottom, like a backward search.
@@ -515,7 +539,25 @@ void PaneSession::find_step(int delta) {
     changed();
 }
 
+void PaneSession::refind_after_reflow() {
+    if (matches_.empty() || find_query_.empty()) return;
+    {
+        std::lock_guard lk(term_mu_);
+        if (!term_) return;
+        const std::optional<size_t> cur = cur_match_;
+        matches_ = search(find_query_);
+        cur_match_.reset();
+        if (cur && !matches_.empty()) {
+            cur_match_ = std::min(*cur, matches_.size() - 1);
+            reveal(matches_[*cur_match_].start.line);
+        }
+        update_highlights();
+    }
+    changed();
+}
+
 void PaneSession::end_find() {
+    find_query_.clear();
     if (matches_.empty()) return;
     matches_.clear();
     cur_match_.reset();
@@ -709,6 +751,28 @@ ui::ScrollMetrics PaneSession::scroll_metrics() const {
     m.rows = g.rows;
     m.offset = static_cast<uint32_t>(std::min<uint64_t>(g.scroll_offset, m.history));
     m.fg = tv_->options().theme.foreground;
+    // The find matches as marks on the bar, at most one per 1/kScrollMarks of it.
+    if (!matches_.empty() && m.history) {
+        std::lock_guard lk(term_mu_);
+        if (term_) {
+            const view::TerminalLines src(*term_);
+            const uint64_t first = src.first_line(), end = src.end_line();
+            if (end > first) {
+                const double span = static_cast<double>(end - first);
+                auto mark = [&](const view::Match& x) {
+                    const double at = x.start.line > first ? static_cast<double>(x.start.line - first) / span : 0.0;
+                    return static_cast<uint16_t>(std::min<double>(ui::kScrollMarks - 1, at * ui::kScrollMarks));
+                };
+                for (const view::Match& x : matches_) {
+                    if (x.start.line < first) continue;   // trimmed from the scrollback
+                    const uint16_t v = mark(x);
+                    if (m.marks.empty() || m.marks.back() != v) m.marks.push_back(v);
+                }
+                if (cur_match_ && *cur_match_ < matches_.size() && matches_[*cur_match_].start.line >= first)
+                    m.current_mark = mark(matches_[*cur_match_]);
+            }
+        }
+    }
     return m;
 }
 
@@ -941,6 +1005,121 @@ void PaneSession::on_snapshot(std::vector<std::byte> ktsn, bool resync) {
     });
 }
 
+namespace {
+
+// A line of stored text as the terminal may show it: controls (C0, DEL, C1 in UTF-8) as spaces.
+void append_shown(std::string& out, std::string_view text) {
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const auto ch = static_cast<unsigned char>(text[i]);
+        if (ch < 0x20 || ch == 0x7F) {
+            out += ' ';
+        } else if (ch == 0xC2 && i + 1 < text.size() && static_cast<unsigned char>(text[i + 1]) >= 0x80 &&
+                   static_cast<unsigned char>(text[i + 1]) <= 0x9F) {
+            out += ' ';
+            ++i;
+        } else {
+            out += static_cast<char>(ch);
+        }
+    }
+}
+
+}  // namespace
+
+std::optional<uint64_t> PaneSession::show_lines(const std::vector<StaticLine>& lines, std::optional<std::size_t> target) {
+    close();
+    mirror_ = false;
+    std::size_t text_bytes = 0;
+    for (const auto& l : lines) text_bytes += l.text.size();
+    vt::TerminalOptions o = term_opts_;
+    // Every line stays: the scrollback holds them all (wrapped rows too, about 8 bytes a cell).
+    const uint64_t rows = static_cast<uint64_t>(lines.size()) * 2 + 1024;
+    const uint64_t bytes = static_cast<uint64_t>(text_bytes) * 16 + static_cast<uint64_t>(lines.size()) * 96 + (4u << 20);
+    o.scrollback_lines = static_cast<uint32_t>(std::min<uint64_t>(rows, 0xFFFFFFFFu));
+    o.scrollback_max_bytes = static_cast<uint32_t>(std::min<uint64_t>(bytes, 0xFFFFFFFFu));
+    auto t = vt::Terminal::create(grid_, o, this);
+    if (!t) {
+        log::error("gui", "terminal: " + t.error().what);
+        return std::nullopt;
+    }
+    (*t)->frames().set_waker([this] { wake(); });
+    (*t)->set_default_cursor(cursor_shape_, cursor_blink_);
+    std::optional<uint64_t> at;
+    std::string buf = "\x1b[?25l";
+    auto flush = [&] {
+        (*t)->feed(std::as_bytes(std::span(buf.data(), buf.size())));
+        buf.clear();
+    };
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const StaticLine& l = lines[i];
+        if (target && *target == i) {
+            flush();
+            const vt::CursorState c = (*t)->cursor();
+            at = (*t)->first_abs_line() + c.row;
+        }
+        if (l.prompt) buf += "\x1b]133;A\x07";
+        if (l.dim) buf += "\x1b[2m";
+        append_shown(buf, l.text);
+        if (l.dim) buf += "\x1b[0m";
+        if (i + 1 < lines.size()) buf += "\r\n";
+        if (buf.size() >= (1u << 20)) flush();
+    }
+    flush();
+    std::string title;
+    {
+        std::lock_guard lk(term_mu_);
+        if (term_.get() == painting_) graveyard_.push_back(std::move(term_));
+        term_ = std::move(*t);
+        sel_ = {};
+        matches_.clear();
+        cur_match_.reset();
+        update_highlights();
+        term_->publish();
+    }
+    tv_->scroll_to(0);
+    exited_ = false;
+    exit_code_.reset();
+    full_next_ = true;
+    changed();
+    return at;
+}
+
+size_t PaneSession::find_at(const std::string& query, uint64_t line) {
+    const size_t n = find(query);
+    if (n == 0) {
+        reveal_line(line);
+        return 0;
+    }
+    {
+        std::lock_guard lk(term_mu_);
+        size_t i = 0;
+        while (i + 1 < matches_.size() && matches_[i].start.line < line) ++i;
+        cur_match_ = i;
+        if (term_) {
+            reveal(matches_[i].start.line);
+            update_highlights();
+        }
+    }
+    changed();
+    return n;
+}
+
+void PaneSession::reveal_line(uint64_t line) {
+    {
+        std::lock_guard lk(term_mu_);
+        if (!term_) return;
+        // Centered, also when it is on screen already (it opened there).
+        const uint64_t screen = term_->first_abs_line();
+        const auto rows = static_cast<uint64_t>(std::max<uint16_t>(1, grid_.rows));
+        if (line >= screen) {
+            tv_->scroll_to(0);
+        } else {
+            const uint64_t want_top = line > rows / 2 ? line - rows / 2 : 0;
+            tv_->scroll_to(static_cast<uint32_t>(std::min<uint64_t>(screen > want_top ? screen - want_top : 0, 0xFFFFFFFEu)));
+        }
+    }
+    changed();
+}
+
 std::size_t PaneSession::retired_terminals() const {
     std::lock_guard lk(term_mu_);
     return graveyard_.size();
@@ -953,6 +1132,7 @@ void PaneSession::on_resized(pty::GridSize size) {
     g.rows = size.rows;
     term_->resize(g);
     term_->publish();
+    post([this] { refind_after_reflow(); });
 }
 
 void PaneSession::on_cwd(const std::string& path, const std::string& source) {

@@ -64,6 +64,10 @@ public:
     bool writes_stopped() const { return stopped_.load(); }
     const std::string& id() const { return session_.id; }
     SessionStoreStats stats() const;
+    // The watermark of `kind`: the seq past the last record the store holds (raw:
+    // past its last byte; other kinds: last seq + 1), 0 when empty. From the files: the open
+    // segment as resumed (a torn tail cut) and appended since, and the sealed segments.
+    Result<uint64_t> end_seq(Kind kind) const;
     // The catalog row id of the open segment of `kind` and its count of written blocks
     // ({0, 0} if none): a jump target for command records.
     std::pair<int64_t, uint32_t> position(Kind kind) const;
@@ -72,6 +76,8 @@ public:
 
 private:
     SessionStore() = default;
+    friend Result<void> for_each_record(SessionStore&, Kind, uint64_t,
+                                        const std::function<bool(const RecordView&)>&);
     struct Open {
         std::unique_ptr<SegmentWriter> w;
         int64_t row = 0;
@@ -92,5 +98,17 @@ private:
     uint64_t next_retry_ms_ = 0;
     SessionStoreStats stats_;
 };
+
+// Reads the records of `kind` of `store`'s series, oldest first, from the first block that
+// reaches past `from_seq` (blocks before it are skipped; records in the first block may start
+// before it). Open blocks are written first. `fn` returns false to stop. Damaged blocks are
+// skipped (Errc::corrupt is not returned: what is readable is the history).
+Result<void> for_each_record(SessionStore& store, Kind kind, uint64_t from_seq,
+                             const std::function<bool(const RecordView&)>& fn);
+
+// The same for a series no writer holds here (a closed one, or another process's): what its
+// catalog rows and files hold now.
+Result<void> for_each_stored_record(Catalog& catalog, const std::filesystem::path& root, const std::string& session,
+                                    Kind kind, uint64_t from_seq, const std::function<bool(const RecordView&)>& fn);
 
 }  // namespace kt::store

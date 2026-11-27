@@ -16,6 +16,9 @@
 namespace kt::ui {
 
 std::string format_bytes(uint64_t bytes);          // "812 MB", "1.2 GB"
+// The status bar's history figures: "1.2 GB of 5 GB" under a limit; without one (0 or
+// UINT64_MAX, the store's "off") the size alone and no limit.
+StorageUsage storage_usage(uint64_t used, uint64_t limit);
 // The last component of a path for the title bar ("keepterm", "Dev"); a root stays ("C:\\", "/").
 std::string folder_label(const std::string& path);
 std::string agent_state(const PaneItem& p);         // "running", "waiting for input", "done", "idle"
@@ -32,9 +35,21 @@ class MainView;
 
 // ---------------------------------------------------------------- the embedded terminal
 
+// What a TerminalWidget asks of the view it sits in: the main window's MainView, or a window
+// that shows one terminal of its own (the output viewer).
+class ITerminalHost {
+public:
+    virtual ~ITerminalHost() = default;
+    virtual ITerminalSurface* terminal(PaneKey) = 0;
+    // A right click (the pane menu); none: the terminal gets it.
+    virtual bool terminal_menu(PaneKey, Vec2 /*window_pos*/) { return false; }
+    // The terminal took the keyboard focus.
+    virtual void terminal_focused(PaneKey) {}
+};
+
 class TerminalWidget final : public Widget, public ImeClient {
 public:
-    TerminalWidget(MainView& mv, PaneKey pane);
+    TerminalWidget(ITerminalHost& host, PaneKey pane);
     ~TerminalWidget() override;
     PaneKey pane() const { return pane_; }
     ITerminalSurface* surface() const;
@@ -72,7 +87,7 @@ private:
     void bar_flash();                      // shown for a moment, then a repaint hides it
     bool bar_pointer(PointerEvent&);       // true when the scrollbar took the event
 
-    MainView& mv_;
+    ITerminalHost& host_;
     PaneKey pane_;
     std::string link_;
     mutable ScrollMetrics painted_{};      // what the bar showed last; a change repaints it
@@ -179,9 +194,10 @@ private:
     };
     Drop drop_for(Widget& row, Vec2 local) const;
     MainView& mv_;
-    Widget* top_ = nullptr;           // header: [traffic lights] [menu] [sidebar toggle]
+    Widget* top_ = nullptr;           // header: [traffic lights] [menu] [sidebar toggle] [search history]
     Button* menu_ = nullptr;
     Button* toggle_ = nullptr;
+    Button* search_ = nullptr;
     ScrollView* scroll_ = nullptr;
     Box* list_ = nullptr;
     Widget* drag_row_ = nullptr;
@@ -246,6 +262,7 @@ private:
     Widget* lead_ = nullptr;
     Button* menu_ = nullptr;          // shown only while the sidebar is hidden
     Button* sidebar_btn_ = nullptr;   // shown only while the sidebar is hidden
+    Button* search_btn_ = nullptr;    // shown only while the sidebar is hidden
     Widget* title_box_ = nullptr;
     Label* title_ = nullptr;
     Label* path_ = nullptr;
@@ -301,6 +318,7 @@ struct MainViewOptions {
 struct MainViewHooks {
     std::function<ITerminalSurface*(PaneKey)> terminal;
     std::function<void(Rect anchor)> app_menu;          // the in-window menu button
+    std::function<void()> search_history;               // the magnifier button: the palette on the history
     std::function<void(Vec2 window_pos, int clicks)> caption_press;   // window drag / zoom
     std::function<void(PaneKey)> pane_focused;          // keyboard focus moved to a pane
     // Opens the resource popover for a scope, anchored to a window rect (above: status bar).
@@ -309,7 +327,7 @@ struct MainViewHooks {
     std::function<std::vector<MenuItem>(PaneKey, bool full)> pane_menu_items;
 };
 
-class MainView final : public Widget {
+class MainView final : public Widget, public ITerminalHost {
 public:
     MainView(IWorkspaceView& view, MainViewHooks hooks, MainViewOptions opts = {});
     ~MainView() override;
@@ -342,6 +360,13 @@ public:
     void project_menu(ProjectKey, Vec2 at);
     void tab_menu(TabKey, Vec2 at);
     void pane_menu(PaneKey, Vec2 at);
+    // ITerminalHost
+    ITerminalSurface* terminal(PaneKey k) override { return hooks_.terminal ? hooks_.terminal(k) : nullptr; }
+    bool terminal_menu(PaneKey k, Vec2 at) override {
+        pane_menu(k, at);
+        return true;
+    }
+    void terminal_focused(PaneKey) override;
     void rename_project_dialog(ProjectKey);
     void rename_tab_dialog(TabKey);
     void confirm_remove_project(ProjectKey);

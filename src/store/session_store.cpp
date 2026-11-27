@@ -1,5 +1,6 @@
 #include "store/session_store.h"
 
+#include <algorithm>
 #include <system_error>
 
 #include "platform/paths.h"
@@ -187,6 +188,56 @@ std::pair<int64_t, trigram::Bits> SessionStore::open_candidates(Kind kind, const
 }  // namespace kt::store
 
 namespace kt::store {
+
+Result<uint64_t> SessionStore::end_seq(Kind kind) const {
+    std::lock_guard lk(mu_);
+    const Open& o = open_[static_cast<std::size_t>(kind)];
+    uint64_t end = o.w ? o.w->seq_end() : 0;
+    SegmentFilter f;
+    f.sessions = {session_.id};
+    f.kinds = {kind};
+    auto rows = catalog_->segments(f);
+    if (!rows) return Unexpected(rows.error());
+    for (const auto& r : *rows) {
+        if (r.id == o.row) continue;  // the writer knows better than its row
+        end = std::max(end, r.info.seq_end);
+    }
+    return end;
+}
+
+Result<void> for_each_record(SessionStore& store, Kind kind, uint64_t from_seq,
+                             const std::function<bool(const RecordView&)>& fn) {
+    if (auto r = store.flush(false); !r) return r;
+    return for_each_stored_record(*store.catalog_, store.root_, store.id(), kind, from_seq, fn);
+}
+
+Result<void> for_each_stored_record(Catalog& catalog, const std::filesystem::path& root, const std::string& session,
+                                    Kind kind, uint64_t from_seq, const std::function<bool(const RecordView&)>& fn) {
+    SegmentFilter f;
+    f.sessions = {session};
+    f.kinds = {kind};
+    auto rows = catalog.segments(f);
+    if (!rows) return Unexpected(rows.error());
+    std::sort(rows->begin(), rows->end(), [](const SegmentRow& a, const SegmentRow& b) { return a.info.series < b.info.series; });
+    std::string raw;
+    std::vector<RecordView> recs;
+    for (const auto& row : *rows) {
+        if (row.info.blocks && row.info.seq_end <= from_seq) continue;
+        auto rd = SegmentReader::open(root / platform::paths::from_utf8(row.file));
+        if (!rd) continue;
+        const auto& blocks = (*rd)->blocks();
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            if (blocks[i].seq_end <= from_seq) continue;
+            if (!(*rd)->read_block(i, raw)) continue;
+            recs.clear();
+            if (!decode_records(raw, blocks[i].first_seq, blocks[i].ts_first, recs)) continue;
+            for (const auto& r : recs) {
+                if (!fn(r)) return {};
+            }
+        }
+    }
+    return {};
+}
 
 std::pair<int64_t, uint32_t> SessionStore::position(Kind kind) const {
     std::lock_guard lk(mu_);

@@ -9,7 +9,8 @@ endfunction()
 kt_module(kt_base
     base/error.cpp
     base/crc32c.cpp
-    base/log.cpp)
+    base/log.cpp
+    base/fault.cpp)
 
 if(WIN32)
     kt_module(kt_platform_core platform/random_win.cpp

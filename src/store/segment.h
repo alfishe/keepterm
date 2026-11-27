@@ -5,6 +5,7 @@
 // SegmentReader is read-only and may be used by one thread; open one per search thread.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -65,6 +66,9 @@ public:
     // True once the segment holds segment_raw raw bytes: the owner seals and starts the next.
     bool full() const { return info_.raw_bytes + pending_raw_ >= opt_.segment_raw; }
     bool empty() const { return info_.blocks == 0 && pending_records_ == 0; }
+    // The seq past the last appended record (raw: past its last byte; other kinds: last seq + 1),
+    // the open block included; 0 when empty.
+    uint64_t seq_end() const { return pending_records_ ? std::max(info_.seq_end, block_seq_end_) : info_.seq_end; }
     // Flushes, writes the footer and the trailer, fsyncs. The writer is unusable afterwards.
     Result<SegmentInfo> seal();
 

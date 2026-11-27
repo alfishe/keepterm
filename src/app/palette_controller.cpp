@@ -129,6 +129,8 @@ void PaletteController::refresh() {
             ui::PaletteRow pr;
             pr.title = it.title;
             pr.subtitle = it.subtitle;
+            pr.detail = it.detail;
+            pr.detail_marks = it.detail_marks;
             pr.section = sec.header;
             if (it.keys) pr.keys = commands::format_sequence(*it.keys, os, commands::Format::Text);
             pr.highlights = row.highlights;

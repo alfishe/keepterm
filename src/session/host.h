@@ -7,6 +7,8 @@
 //   --session-host <id>        the new session's id
 //   --ready <fd|handle>        ready channel inherited from spawn_detached
 //   --restore-from <old-id>    recover the history of a dead session first
+//   --restore-history <id>     continue a closed (archived) series from its final screen
+//   --resume-run <n>           with --restore-history: resume the series' n-th agent run
 //   --cwd <dir>                start folder (nearest existing parent, then home)
 //   --size <cols>x<rows>
 //   --no-history               no journal, no checkpoints

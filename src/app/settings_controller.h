@@ -34,6 +34,16 @@ class ThemeLibrary;
 
 namespace kt::app {
 
+// Settings → History: figures and deletions of the session history.
+struct HistorySummary {
+    uint64_t sessions = 0, closed = 0, pinned = 0;
+    uint64_t raw_bytes = 0, stored_bytes = 0;
+};
+struct HistoryDeletion {
+    std::vector<std::string> ids;
+    uint64_t stored_bytes = 0;
+};
+
 struct SettingsEnv {
     std::filesystem::path config_file;                 // ConfigWriter::target_file
     std::string config_file_display;                   // "~/.config/keepterm/config.toml"; "" = the path
@@ -48,6 +58,14 @@ struct SettingsEnv {
     std::function<Result<void>(const std::string& session, bool pinned)> pin_session;
     std::function<Result<void>(const std::string& session)> forget_session;
     std::function<void()> open_config_file;
+    // History. Null: the History pane shows only its settings.
+    std::function<Result<HistorySummary>()> history_summary;
+    // What storage.keep_closed = `ms` (0 = for good) deletes now, with the project overrides.
+    std::function<HistoryDeletion(std::int64_t keep_closed_ms)> history_due;
+    // The closed, unpinned sessions that ended before `before_ms` (0: all of them).
+    std::function<HistoryDeletion(std::uint64_t before_ms)> history_closed_before;
+    std::function<Result<void>(const std::vector<std::string>& ids)> delete_history;
+    std::function<void()> open_session_history;
     // Agents → "Claude Code: exact context via status line" (agents/context_hook.h): the hook the
     // toggle installs and uninstalls, the same code as `keepterm --agent-hook`. Null: the row
     // says it is not available.
@@ -106,6 +124,11 @@ private:
     void add_keymaps(ui::Widget& page);
     void add_agents(ui::Widget& page);
     void add_storage(ui::Widget& page);
+    void add_history(ui::Widget& page);
+    // Writes a value chosen in a control; a shorter storage.keep_closed first asks to delete
+    // what it deletes now.
+    void commit_choice(config::KeyId k, const config::Value& v);
+    void delete_history_dialog();
     void add_advanced(ui::Widget& page);
     void update_rows();
     void update_banner();

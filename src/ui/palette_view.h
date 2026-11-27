@@ -13,6 +13,8 @@ namespace kt::ui {
 
 struct PaletteRow {
     std::string title, subtitle;
+    std::string detail;                    // a second line (mono), with marked ranges
+    std::vector<std::pair<size_t, size_t>> detail_marks;
     std::string section;                   // a header is drawn where the section changes
     std::string keys;                      // key caps ("⌘D", "Ctrl+Shift+D")
     std::vector<uint32_t> highlights;      // byte offsets of matched characters in title

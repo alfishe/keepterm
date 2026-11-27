@@ -340,6 +340,9 @@ public:
     virtual EventResult on_text(std::string_view) { return EventResult::Ignored; }
     virtual void on_hover(bool inside);
     virtual void on_focus(FocusChange) { invalidate_paint(); }
+    // The window's scale or theme changed: text shaped before has the old size. Drops what the
+    // widget keeps shaped and lays it out again (Window calls it on every widget).
+    virtual void on_text_metrics_changed() { invalidate_layout(); }
     virtual bool accepts_focus() const { return false; }
     virtual ImeClient* ime_client() { return nullptr; }
     virtual platform::CursorShape cursor_at(Vec2) const { return platform::CursorShape::arrow; }

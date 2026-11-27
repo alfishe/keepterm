@@ -367,18 +367,18 @@ KT_KEY(keys_passthrough_programs, "keys.passthrough_programs", List, List(), NoR
        false, "Programs that receive chords of bindings with passthrough = true.")
 
 // ---------------------------------------------------------------- [storage]
-KT_KEY(storage_max_total, "storage.max_total", Size, "5GiB", Range("64MiB", "64TiB"), Live, "", false,
-       "Disk cap for the whole history store.")
-KT_KEY(storage_max_per_session, "storage.max_per_session", Size, "1GiB", Range("16MiB", "64TiB"), Live, "",
-       true, "Disk cap per session.")
-KT_KEY(storage_max_age, "storage.max_age", Duration, "2160h", Range("1h", "87600h"), Live, "", true,
-       "Age limit for stored output and text (2160h = 90 days).")
-KT_KEY(storage_keep_closed, "storage.keep_closed", Duration, "720h", Range("0s", "87600h"), Live, "", true,
-       "How long the history of closed sessions is kept (720h = 30 days).")
-KT_KEY(storage_raw_max_age, "storage.raw_max_age", Duration, "168h", Range("1h", "87600h"), Live, "", true,
-       "Age limit for the raw output stream (168h = 7 days); after it only the text and commands stay. Pinned sessions keep raw.")
-KT_KEY(storage_events_max_age, "storage.events_max_age", Duration, "720h", Range("1h", "87600h"), Live, "",
-       true, "Age limit for phase 2/3 events.")
+KT_KEY(storage_max_total, "storage.max_total", Size, "0B", Range("0B", "64TiB"), Live, "", false,
+       "Disk cap for the whole history store; 0 = none (nothing is deleted for it).")
+KT_KEY(storage_max_per_session, "storage.max_per_session", Size, "0B", Range("0B", "64TiB"), Live, "",
+       true, "Disk cap per session; 0 = none.")
+KT_KEY(storage_max_age, "storage.max_age", Duration, "0s", Range("0s", "87600h"), Live, "", true,
+       "Age limit for stored output and text (e.g. 2160h = 90 days); 0 = none.")
+KT_KEY(storage_keep_closed, "storage.keep_closed", Duration, "0s", Range("0s", "87600h"), Live, "", true,
+       "How long the history of closed sessions is kept (e.g. 720h = 30 days); 0 = for good.")
+KT_KEY(storage_raw_max_age, "storage.raw_max_age", Duration, "0s", Range("0s", "87600h"), Live, "", true,
+       "Age limit for the raw output stream (e.g. 168h = 7 days); after it only the text and commands stay. Pinned sessions keep raw. 0 = none.")
+KT_KEY(storage_events_max_age, "storage.events_max_age", Duration, "0s", Range("0s", "87600h"), Live, "",
+       true, "Age limit for phase 2/3 events; 0 = none.")
 KT_KEY(storage_resources_downsample, "storage.resources_downsample", List, List("24h", "720h", "2160h"), NoRange, Live,
        "", false, "Resource samples: full rate up to the first age, per minute up to the second, dropped after the third.")
 // Compression tiers. The defaults are provisional: they are to

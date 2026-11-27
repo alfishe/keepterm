@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #include "base/log.h"
 #include "text/font.h"
@@ -48,10 +49,15 @@ Result<void> UiWindowHost::init() {
     if (!w) return Unexpected(w.error());
     win_ = std::move(*w);
     scale_ = win_->scale();
+    zoom_ = std::clamp(spec_.zoom, UiWindowHost::kZoomMin, UiWindowHost::kZoomMax);
     px_ = win_->client_size_px();
     auto surf = win_->create_surface(platform::SurfaceRequest{});
     if (!surf) return Unexpected(surf.error());
-    auto r = render::create_renderer(spec_.renderer, &*surf, render::PxSize{px_.w, px_.h}, scale_, spec_.render_config);
+    native_view_ = surf->handle;
+    // A window without a native surface (a headless platform) renders offscreen.
+    const bool native = surf->handle || surf->layer || surf->xid;
+    auto r = render::create_renderer(native ? spec_.renderer : std::string("software"), native ? &*surf : nullptr,
+                                     render::PxSize{px_.w, px_.h}, scale_, spec_.render_config);
     if (!r) return Unexpected(r.error());
     r_ = std::move(*r);
     r_->on_switch([this, alive = alive_](render::BackendKind, render::BackendKind, const std::string&) {
@@ -68,7 +74,7 @@ Result<void> UiWindowHost::init() {
     uiw_->set_motion(spec_.motion);
     uiw_->request_frame = [this] { request_frame(); };
     uiw_->set_ime_rect = [this](ui::Rect rc) {
-        if (win_) win_->set_ime_cursor_rect(platform::DipRect{rc.x, rc.y, rc.w, rc.h});
+        if (win_) win_->set_ime_cursor_rect(platform::DipRect{rc.x * zoom_, rc.y * zoom_, rc.w * zoom_, rc.h * zoom_});
     };
     uiw_->set_cursor = [this](platform::CursorShape s) {
         if (win_) win_->set_cursor(s);
@@ -79,7 +85,7 @@ Result<void> UiWindowHost::init() {
     uiw_->set_clipboard = [this](const std::string& s) {
         if (spec_.set_clipboard) spec_.set_clipboard(s);
     };
-    uiw_->resize(ui::Size{static_cast<float>(px_.w) / scale_, static_cast<float>(px_.h) / scale_}, scale_);
+    uiw_->resize(ui::Size{static_cast<float>(px_.w) / ui_scale(), static_cast<float>(px_.h) / ui_scale()}, ui_scale());
     return {};
 }
 
@@ -175,7 +181,7 @@ void UiWindowHost::draw() {
     if (ui::Widget* f = uiw_->focused()) {
         if (ui::ImeClient* ic = f->ime_client()) {
             const ui::Rect c = ic->ime_caret_rect();
-            win_->set_ime_cursor_rect(platform::DipRect{c.x, c.y, c.w, c.h});
+            win_->set_ime_cursor_rect(platform::DipRect{c.x * zoom_, c.y * zoom_, c.w * zoom_, c.h * zoom_});
         }
     }
     const bool full = fr.full || full_next_;
@@ -211,23 +217,48 @@ void UiWindowHost::on_destroyed() {
     if (auto fn = std::move(spec_.closed)) p_.loop().post(std::move(fn));
 }
 
-void UiWindowHost::on_resized(platform::PxSize px, platform::DipSize dip) {
+void UiWindowHost::apply_scale() {
     if (!r_ || !uiw_) return;
-    px_ = px;
-    r_->resize(render::PxSize{px.w, px.h}, scale_);
-    uiw_->resize(ui::Size{dip.w, dip.h}, scale_);
+    r_->resize(render::PxSize{px_.w, px_.h}, scale_);   // the display's: Metal sets it as the layer's contentsScale
+    uiw_->resize(ui::Size{static_cast<float>(px_.w) / ui_scale(), static_cast<float>(px_.h) / ui_scale()}, ui_scale());
     full_next_ = true;
     request_frame();
+    if (spec_.scale_changed && ui_scale() != scale_sent_) {
+        scale_sent_ = ui_scale();
+        spec_.scale_changed(scale_sent_);
+    }
+}
+
+void UiWindowHost::on_resized(platform::PxSize px, platform::DipSize) {
+    px_ = px;
+    apply_scale();
 }
 
 void UiWindowHost::on_scale_changed(float scale, platform::DipRect) {
-    if (!r_ || !uiw_ || scale <= 0) return;
+    if (!win_ || scale <= 0) return;
     scale_ = scale;
     px_ = win_->client_size_px();
-    r_->resize(render::PxSize{px_.w, px_.h}, scale_);
-    uiw_->resize(ui::Size{static_cast<float>(px_.w) / scale_, static_cast<float>(px_.h) / scale_}, scale_);
-    full_next_ = true;
-    request_frame();
+    apply_scale();
+}
+
+void UiWindowHost::set_zoom(float zoom) {
+    zoom = std::clamp(std::round(zoom * 10.0f) / 10.0f, kZoomMin, kZoomMax);
+    if (zoom == zoom_) return;
+    zoom_ = zoom;
+    apply_scale();
+    if (spec_.zoom_changed) spec_.zoom_changed(zoom_);
+}
+
+void UiWindowHost::step_zoom(int delta) { set_zoom(delta == 0 ? 1.0f : zoom_ + kZoomStep * static_cast<float>(delta)); }
+
+float UiWindowHost::render_scale() const { return r_ ? r_->scale() : 0.0f; }
+
+bool UiWindowHost::menu_command(std::string_view id) {
+    if (id == "terminal.font_bigger") step_zoom(1);
+    else if (id == "terminal.font_smaller") step_zoom(-1);
+    else if (id == "terminal.font_reset") step_zoom(0);
+    else return false;
+    return true;
 }
 
 void UiWindowHost::on_focus(bool focused) {
@@ -264,12 +295,19 @@ void UiWindowHost::on_composition(const platform::Composition& c) {
     if (uiw_) uiw_->on_composition(c);
 }
 
+// Pointer positions come in DIPs; the widgets are laid out in DIPs / zoom.
 void UiWindowHost::on_mouse(const platform::MouseEvent& m) {
-    if (uiw_) uiw_->on_mouse(m);
+    if (!uiw_) return;
+    platform::MouseEvent z = m;
+    z.pos = {m.pos.x / zoom_, m.pos.y / zoom_};
+    uiw_->on_mouse(z);
 }
 
 void UiWindowHost::on_scroll(const platform::ScrollEvent& s) {
-    if (uiw_) uiw_->on_scroll(s);
+    if (!uiw_) return;
+    platform::ScrollEvent z = s;
+    z.pos = {s.pos.x / zoom_, s.pos.y / zoom_};
+    uiw_->on_scroll(z);
 }
 
 }  // namespace kt::app

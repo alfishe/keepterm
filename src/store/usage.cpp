@@ -14,6 +14,11 @@ LimitUsage make_limit(uint64_t used, uint64_t limit) {
     LimitUsage l;
     l.used = used;
     l.limit = limit;
+    if (limit == kOff) {  // no limit: never near it
+        l.remaining = kOff;
+        l.percent = 0;
+        return l;
+    }
     l.remaining = used < limit ? limit - used : 0;
     l.percent = limit ? 100.0 * static_cast<double>(used) / static_cast<double>(limit) : (used ? 100.0 : 0.0);
     return l;
@@ -122,6 +127,7 @@ Result<Usage> usage(Catalog& catalog, const fs::path& root, const Policy& policy
 
     // The nearest age expiry (what a pass removes first by age).
     auto consider = [&](Eviction e) {
+        if (e.at_ms == kOff) return;  // that limit is off
         if (!u.next_expiry || e.at_ms < u.next_expiry->at_ms) u.next_expiry = std::move(e);
     };
     for (const auto& r : *segs) {
@@ -134,7 +140,7 @@ Result<Usage> usage(Catalog& catalog, const fs::path& root, const Policy& policy
         e.segment_id = r.id;
         e.kind = r.info.kind;
         e.bytes = r.info.file_bytes;
-        e.at_ms = r.info.ts_first + age;
+        e.at_ms = add_sat(r.info.ts_first, age);
         e.reason = age_reason(r.info.kind, pol);
         consider(e);
     }
@@ -142,7 +148,7 @@ Result<Usage> usage(Catalog& catalog, const fs::path& root, const Policy& policy
         if (!s.ended_ms || s.pinned) continue;
         Eviction e;
         e.session = s.id;
-        e.at_ms = *s.ended_ms + policy_of(s.id).keep_closed_ms;
+        e.at_ms = add_sat(*s.ended_ms, policy_of(s.id).keep_closed_ms);
         e.reason = "keep_closed";
         const auto it = per.find(s.id);
         e.bytes = it != per.end() ? it->second.cap.used : 0;

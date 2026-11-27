@@ -36,5 +36,10 @@ void set_badge(int count);
 using Post = std::function<void(std::function<void()>)>;
 bool pick_folder(void* native_view, const std::string& title, const std::string& initial,
                  std::function<void(std::string)> done, const Post& post);
+// The system "save as" chooser, in `folder` with `name` filled in; `done` as for pick_folder,
+// with the chosen file's path. It asks before replacing a file. macOS: NSSavePanel as a sheet.
+// Windows: IFileSaveDialog (modal). Linux: zenity or kdialog. False when there is no chooser.
+bool pick_save_file(void* native_view, const std::string& title, const std::string& folder, const std::string& name,
+                    std::function<void(std::string)> done, const Post& post);
 
 }  // namespace kt::app::desktop

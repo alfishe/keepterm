@@ -8,6 +8,18 @@
 namespace kt::ui {
 
 namespace {
+// Keeps a path in Window::guarded_ while handlers run along it.
+struct PathGuard {
+    std::vector<std::vector<Widget*>*>& list;
+    std::vector<Widget*>* path;
+    PathGuard(std::vector<std::vector<Widget*>*>& l, std::vector<Widget*>* p) : list(l), path(p) { list.push_back(p); }
+    ~PathGuard() { list.erase(std::remove(list.begin(), list.end(), path), list.end()); }
+    PathGuard(const PathGuard&) = delete;
+    PathGuard& operator=(const PathGuard&) = delete;
+};
+}  // namespace
+
+namespace {
 
 // The top layer of the window: base content and the overlay layer, both full size.
 class RootStack final : public Widget {
@@ -161,11 +173,22 @@ void Window::set_root(std::unique_ptr<Widget> w) {
 }
 
 void Window::resize(Size dip, float scale) {
+    scale = scale > 0 ? scale : 1;
     if (dip == size_ && scale == scale_) return;
+    const bool rescaled = scale != scale_;
     size_ = dip;
-    scale_ = scale > 0 ? scale : 1;
-    root_->invalidate_layout();
+    scale_ = scale;
+    if (rescaled) text_metrics_changed();   // a new display, the window's zoom
+    else root_->invalidate_layout();
     invalidate_all();
+}
+
+void Window::text_metrics_changed() {
+    std::function<void(Widget&)> all = [&](Widget& w) {
+        w.on_text_metrics_changed();
+        for (const auto& c : w.children()) all(*c);
+    };
+    all(*root_);
 }
 
 render::PxSize Window::px_size() const {
@@ -174,11 +197,7 @@ render::PxSize Window::px_size() const {
 
 void Window::set_theme(Theme t) {
     theme_ = std::move(t);
-    std::function<void(Widget&)> all = [&](Widget& w) {
-        w.invalidate_layout();
-        for (const auto& c : w.children()) all(*c);
-    };
-    all(*root_);
+    text_metrics_changed();   // the fonts and sizes of the roles
     invalidate_all();
 }
 
@@ -224,6 +243,8 @@ void Window::request_animation_frame(Widget* w) {
 void Window::forget(Widget* w) {
     if (focus_ == w) focus_ = nullptr;
     if (capture_ == w) capture_ = nullptr;
+    if (pressed_ == w) pressed_ = nullptr;
+    for (auto* path : guarded_) std::replace(path->begin(), path->end(), w, static_cast<Widget*>(nullptr));
     if (tip_owner_ == w) {
         tip_owner_ = nullptr;
         if (tip_timer_) cancel_timer(tip_timer_);
@@ -550,18 +571,24 @@ void Window::update_hover() {
     } else if (capture_) {
         for (Widget* w = capture_; w; w = w->parent()) path.push_back(w);
     }
-    for (Widget* w : hover_path_) {
-        if (std::find(path.begin(), path.end(), w) == path.end()) {
-            w->hovered_ = false;
-            w->on_hover(false);
+    // on_hover may remove widgets: both paths are guarded while it runs.
+    std::vector<Widget*> old = hover_path_;
+    {
+        PathGuard g1(guarded_, &old), g2(guarded_, &path);
+        for (Widget*& w : old) {
+            if (w && std::find(path.begin(), path.end(), w) == path.end()) {
+                w->hovered_ = false;
+                w->on_hover(false);
+            }
+        }
+        for (Widget*& w : path) {
+            if (w && std::find(old.begin(), old.end(), w) == old.end()) {
+                w->hovered_ = true;
+                w->on_hover(true);
+            }
         }
     }
-    for (Widget* w : path) {
-        if (std::find(hover_path_.begin(), hover_path_.end(), w) == hover_path_.end()) {
-            w->hovered_ = true;
-            w->on_hover(true);
-        }
-    }
+    path.erase(std::remove(path.begin(), path.end(), nullptr), path.end());
     const bool changed = path != hover_path_;
     hover_path_ = std::move(path);
     // Cursor of the deepest widget that names one.
@@ -620,17 +647,30 @@ void Window::show_tooltip_for(Widget* w) {
 
 // ---------------------------------------------------------------- pointer
 
+
+template <typename F> bool Window::bubble(Widget* start, F fn) {
+    std::vector<Widget*> path;
+    for (Widget* w = start; w; w = w->parent()) path.push_back(w);
+    PathGuard g(guarded_, &path);
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        Widget* w = path[i];
+        if (!w || !w->enabled()) continue;
+        if (fn(w, path, i)) return true;
+    }
+    return false;
+}
+
 void Window::dispatch_pointer(PointerEvent& e, Widget* target) {
-    for (Widget* w = target; w; w = w->parent()) {
-        if (!w->enabled()) continue;
+    (void)bubble(target, [&](Widget* w, const std::vector<Widget*>& path, std::size_t i) {
         e.local = w->to_local(e.pos);
         e.captured = w == capture_;
         if (w->on_pointer(e) == EventResult::Handled) {
-            if (e.type == PointerEvent::Type::Press && !capture_) capture_ = w;
-            return;
+            // Not a widget the press removed.
+            if (e.type == PointerEvent::Type::Press && !capture_ && path[i]) capture_ = w;
+            return true;
         }
-        if (e.captured) return;   // capture does not bubble
-    }
+        return e.captured;   // capture does not bubble
+    });
 }
 
 void Window::on_mouse(const platform::MouseEvent& m) {
@@ -687,8 +727,10 @@ void Window::on_mouse(const platform::MouseEvent& m) {
                 }
             }
             capture_ = nullptr;
+            pressed_ = target;
             dispatch_pointer(e, target);
-            if (!capture_) capture_ = target;
+            if (!capture_) capture_ = pressed_;   // null when the press removed it
+            pressed_ = nullptr;
             update_hover();
             return;
         }
@@ -739,11 +781,10 @@ void Window::on_scroll(const platform::ScrollEvent& s) {
     e.mods = s.mods;
     e.pos = {s.pos.x, s.pos.y};
     show_tooltip_for(nullptr);
-    for (Widget* w = hit_test(e.pos); w; w = w->parent()) {
-        if (!w->enabled()) continue;
+    (void)bubble(hit_test(e.pos), [&](Widget* w, const std::vector<Widget*>&, std::size_t) {
         e.local = w->to_local(e.pos);
-        if (w->on_wheel(e) == EventResult::Handled) return;
-    }
+        return w->on_wheel(e) == EventResult::Handled;
+    });
 }
 
 // ---------------------------------------------------------------- keyboard, text, IME, focus
@@ -791,10 +832,7 @@ void Window::focus_next(bool backward) {
 }
 
 void Window::key_to_focus(const KeyEvent& k) {
-    for (Widget* w = focus_; w; w = w->parent()) {
-        if (!w->enabled()) continue;
-        if (w->on_key(k) == EventResult::Handled) return;
-    }
+    (void)bubble(focus_, [&](Widget* w, const std::vector<Widget*>&, std::size_t) { return w->on_key(k) == EventResult::Handled; });
 }
 
 void Window::on_key(const KeyEvent& k) {
@@ -824,9 +862,12 @@ void Window::on_key(const KeyEvent& k) {
     if (keymap && !has_modal() && keymap(k)) return;
     // 4. The focused widget, bubbling.
     if (k.key == K::tab && k.action != platform::KeyAction::release && (k.mods & (platform::mod_ctrl | platform::mod_super)) == 0) {
-        Widget* f = focus_;
+        // Tab goes to disabled widgets too: they may still take it.
+        std::vector<Widget*> path;
+        for (Widget* w = focus_; w; w = w->parent()) path.push_back(w);
+        PathGuard g(guarded_, &path);
         bool handled = false;
-        for (Widget* w = f; w && !handled; w = w->parent()) handled = w->on_key(k) == EventResult::Handled;
+        for (std::size_t i = 0; i < path.size() && !handled; ++i) handled = path[i] && path[i]->on_key(k) == EventResult::Handled;
         if (!handled) focus_next((k.mods & platform::mod_shift) != 0);
         return;
     }
@@ -844,10 +885,7 @@ void Window::on_text(std::string_view text) {
             }
         }
     }
-    for (Widget* w = focus_; w; w = w->parent()) {
-        if (!w->enabled()) continue;
-        if (w->on_text(text) == EventResult::Handled) return;
-    }
+    (void)bubble(focus_, [&](Widget* w, const std::vector<Widget*>&, std::size_t) { return w->on_text(text) == EventResult::Handled; });
 }
 
 void Window::on_composition(const platform::Composition& c) {

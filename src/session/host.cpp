@@ -6,7 +6,7 @@
 //   accept     one per endpoint; one reader and one writer thread per client
 //   ticker     journal pump and flush, checkpoints, record.json, cwd queries
 //   agents     agent capture into record.json and the agent restore (session/agent_keeper.h)
-//   history    the warm store writer (session/history_writer.h), low priority, fed from the
+//   history    the warm store writer (session/history_writer.h), normal priority, fed from the
 //              journal; it takes mu_ only for short bounded reads of the scrollback
 //   janitor    store retention and repacking while this host holds the leader lock
 //   shutdown   SIGTERM/SIGHUP (POSIX) or the end-session window (Windows): save and end
@@ -27,10 +27,12 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "base/fault.h"
 #include "base/log.h"
 #include "config/service.h"
 #include "platform/paths.h"
@@ -39,9 +41,12 @@
 #include "resources/containment_setup.h"
 #include "session/agent_context.h"
 #include "session/agent_keeper.h"
+#include "session/archive.h"
 #include "session/client.h"
 #include "session/cwd.h"
 #include "session/history.h"
+#include "session/history_catchup.h"
+#include "session/history_index.h"
 #include "session/history_writer.h"
 #include "session/ipc.h"
 #include "session/journal.h"
@@ -50,6 +55,7 @@
 #include "session/proc_chain.h"
 #include "session/protocol.h"
 #include "session/registry.h"
+#include "store/file_io.h"
 #include "store/retention.h"
 #include "store/usage.h"
 #include "vt/terminal.h"
@@ -72,12 +78,16 @@ struct Options {
     SessionId id;
     int64_t ready = -1;
     std::optional<SessionId> restore_from;
+    // --restore-history <history_id>: continue a closed series from its final screen (Restore);
+    // --resume-run <n>: then resume its n-th agent run (0 = the first).
+    std::string restore_history;
+    std::optional<std::size_t> resume_run;
     std::string cwd;
     vt::GridSize size{80, 24};
     bool history = true;
-    // The warm history store writer. Off by default until the history on/off PTY
-    // benchmark has run on every OS; --store turns it on.
-    bool store = false;
+    // The warm history store writer; --no-store turns it off. It writes only with
+    // `history` on: private panes and session.history = false never write it.
+    bool store = true;
     bool journal_fallback = false;
     pty::BackendChoice backend = pty::BackendChoice::Auto;
     uint32_t scrollback = 10'000;
@@ -212,8 +222,12 @@ private:
     void make_keeper();
     void agents_loop();
     void capture_agent();
+    // Under mu_: ends the run of `before` and starts one for `after` in record_.agent_runs.
+    void log_agent_run(const std::optional<agents::AgentResume>& before, const std::optional<agents::AgentResume>& after,
+                       uint64_t now);
     // PROCESS_INFO with the foreground chain (read outside mu_).
     proto::ProcessInfo process_info_full();
+    Result<pty::Pid> foreground();
 
     // Under mu_.
     void enqueue(Client& c, std::vector<std::byte> frame);
@@ -233,6 +247,8 @@ private:
     void write_record_now();
     void finish(bool delete_folder);
     void start_store(const std::string& shell);
+    // Takes the series writer lock of `history_id` (once; waits up to 5 s).
+    Result<void> lock_series(const std::string& history_id);
     void stop_store(std::optional<uint64_t> ended_ms);
 
     Options o_;
@@ -261,6 +277,8 @@ private:
     bool delete_on_end_ = false;  // KILL from a client: the pane is gone
     bool pane_closed_ = false;    // EXIT_ACK{pane_closed}
     std::atomic<bool> replaying_{false};   // recover_session() feeds the old history
+    HistoryCatchUp* catchup_ = nullptr;    // while replaying_ with the store: gets the commands
+    std::unique_ptr<store::LockFile> host_lock_, series_lock_;
     std::condition_variable exit_cv_;
 
     std::mutex pty_mu_;
@@ -324,19 +342,80 @@ Result<void> Host::setup() {
     record_.id = o_.id;
     record_.created_unix_ms = os::unix_ms();
     record_.history = o_.history;
+    record_.store = o_.history && o_.store;
     record_.restored_from = o_.restore_from;
     std::string start_cwd = o_.cwd;
     std::string separator;
 
+    // The session folder and its host lock, held while this process lives.
+    if (auto r = os::make_private_dir(state_dir_); !r) return r;
+    if (auto l = wait_lock(platform::paths::from_utf8(os::join(state_dir_, kHostLockFile)), 5s)) {
+        host_lock_ = std::move(*l);
+    } else {
+        log::warn("host", "host lock: " + l.error().what);
+    }
+
     // the old history before the child starts and before any client.
     std::string old_dir;
+    std::unique_ptr<store::LockFile> old_lock;
     if (o_.restore_from) {
         old_dir = os::join(paths_.state_sessions, o_.restore_from->str());
+        if (!has_session_files(old_dir)) {
+            // A restore of it ran before and removed it, but its pane never learned the new id:
+            // continue from the newest dead successor.
+            if (auto succ = find_successor(paths_.state_sessions, *o_.restore_from)) {
+                log::info("host", "restore source " + o_.restore_from->str() + " is gone; continuing from " + *succ);
+                old_dir = *succ;
+                const std::string name = std::filesystem::path(platform::paths::from_utf8(*succ)).filename().string();
+                if (auto sid = SessionId::parse(name)) record_.restored_from = *sid;
+            }
+        }
+        // No host runs there and no archiver reads it while we do.
+        auto ol = wait_lock(platform::paths::from_utf8(os::join(old_dir, kHostLockFile)), 5s);
+        if (!ol) return Unexpected(ol.error());
+        old_lock = std::move(*ol);
         if (o_.history) {
+            std::unique_ptr<HistoryCatchUp> catchup;
+            std::unique_ptr<store::Catalog> cat;
+            std::unique_ptr<store::SessionStore> st;
+            if (o_.store) {
+                // The store catches up from the old journal while the replay runs.
+                auto old_rec = read_recovery_record(old_dir);
+                const std::string hid = old_rec && !old_rec->history_id.empty() ? old_rec->history_id
+                                                                                 : o_.restore_from->str();
+                if (auto r = lock_series(hid); !r) return r;
+                const auto root = platform::paths::from_utf8(os::join(paths_.state, "history"));
+                auto c = store::Catalog::open(root / store::kCatalogFile);
+                if (!c) return Unexpected(c.error());
+                cat = std::move(*c);
+                store::SessionRow row;
+                row.id = hid;
+                row.cwd = old_rec ? old_rec->cwd : std::string();
+                row.shell = old_rec ? old_rec->shell : std::string();
+                row.started_ms = old_rec ? old_rec->created_unix_ms : os::unix_ms();
+                auto so = store::SessionStore::open(root, *cat, row);
+                if (!so) return Unexpected(so.error());
+                st = std::move(*so);
+                CatchUpOptions co;
+                co.term = topts;
+                co.cwd = row.cwd;
+                catchup = std::make_unique<HistoryCatchUp>(*st, *cat, co);
+            }
             replaying_ = true;
-            auto rec = recover_session(old_dir, topts, this);
+            catchup_ = catchup.get();
+            auto rec = catchup ? catchup->run(old_dir, this) : recover_session(old_dir, topts, this);
+            catchup_ = nullptr;
             replaying_ = false;
             if (!rec) return Unexpected(rec.error());
+            (void)KT_FAULT_POINT("host.restore.caught_up");
+            if (catchup) {
+                const auto& cs = catchup->stats();
+                log::info("history", "caught up from " + old_dir + ": " + std::to_string(cs.raw_bytes) + " raw bytes, " +
+                                         std::to_string(cs.lines) + " lines (" + std::to_string(cs.lines_skipped) +
+                                         " stored before), " + std::to_string(cs.commands) + " commands" +
+                                         (cs.raw_gap ? ", raw gap " + std::to_string(cs.raw_gap) : std::string()) +
+                                         (cs.text_misaligned ? ", text misaligned" : ""));
+            }
             log::info("host", "recovered " + o_.restore_from->str() + ": checkpoint " +
                                   (rec->checkpoint_seq ? std::to_string(*rec->checkpoint_seq) : std::string("none")) +
                                   ", " + std::to_string(rec->replayed_records) + " records, " +
@@ -347,19 +426,55 @@ Result<void> Host::setup() {
                 record_.history_id = rec->record->history_id.empty() ? o_.restore_from->str() : rec->record->history_id;
                 if (start_cwd.empty()) start_cwd = rec->record->cwd;
                 record_.title = rec->record->title;
+                record_.tab_title = rec->record->tab_title;
                 record_.agent = rec->record->agent;
                 record_.agent_restore = rec->record->agent_restore;
                 record_.theme_fg = rec->record->theme_fg;
                 record_.theme_bg = rec->record->theme_bg;
                 record_.theme_cursor = rec->record->theme_cursor;
+                record_.agent_runs = rec->record->agent_runs;
+                record_.restores = rec->record->restores;
+                if (record_.project.is_null()) record_.project = rec->record->project;
             }
+            record_.restores.push_back(record_.created_unix_ms);
             separator = restored_separator(rec->last_unix_ms ? rec->last_unix_ms : os::unix_ms());
         } else if (auto r = read_recovery_record(old_dir)) {
             record_.history_id = r->history_id.empty() ? o_.restore_from->str() : r->history_id;
             if (start_cwd.empty()) start_cwd = r->cwd;
             record_.agent = r->agent;
             record_.agent_restore = r->agent_restore;
+            record_.agent_runs = r->agent_runs;
+            record_.restores = r->restores;
+            record_.restores.push_back(record_.created_unix_ms);
+            if (record_.project.is_null()) record_.project = r->project;
         }
+    }
+    // A closed series: its final screen, and the series goes on under its id.
+    if (!o_.restore_history.empty() && !o_.restore_from) {
+        const std::string hid = o_.restore_history;
+        // One writer per series: a running host of it makes this restore fail.
+        if (o_.history && o_.store) {
+            if (auto r = lock_series(hid); !r) return r;
+        }
+        auto man = read_manifest(paths_.state, hid);
+        if (!man) return Unexpected(man.error());
+        const HistoryEntry e = entry_from_manifest(*man);
+        const std::string snap_path = os::join(os::join(os::join(paths_.state, "history"), hid), kFinalSnapshotFile);
+        if (auto snap = os::read_file(snap_path, 1u << 30)) {
+            auto t = vt::Terminal::restore(std::as_bytes(std::span(snap->data(), snap->size())), topts, this);
+            if (t) term_ = std::move(*t);
+            else log::warn("host", "final screen of " + hid + ": " + t.error().what);
+        }
+        if (o_.history) record_.history_id = hid;
+        record_.title = e.title;
+        record_.tab_title = e.tab_title;
+        record_.project = e.project;
+        record_.agent_runs = e.agents;
+        record_.restores = e.restores;
+        record_.restores.push_back(record_.created_unix_ms);
+        if (start_cwd.empty()) start_cwd = expand_tilde(e.cwd_last, os::home_dir());
+        if (term_) separator = restored_separator(e.ended_ms ? *e.ended_ms : e.last_used_ms ? e.last_used_ms : os::unix_ms());
+        log::info("host", "restoring closed session " + hid + (term_ ? " from its final screen" : " without a screen"));
     }
     // with agents.restore off the record goes; otherwise the old pane's agent is
     // resumed once the new shell is idle.
@@ -368,6 +483,17 @@ Result<void> Host::setup() {
     } else if (o_.restore_from && record_.agent_restore) {
         restore_agent_ = agent_record_from_json(record_.agent);
     }
+    // An agent run of the series chosen to resume (Session History, `history restore`).
+    if (o_.resume_run) {
+        const std::vector<AgentRun> runs = record_.agent_runs;
+        if (*o_.resume_run < runs.size()) {
+            const AgentRun& run = runs[*o_.resume_run];
+            restore_agent_ = agents::AgentResume{run.agent, run.conversation, expand_tilde(run.cwd, os::home_dir()), run.args};
+        } else {
+            log::warn("host", "--resume-run " + std::to_string(*o_.resume_run) + ": the session has " +
+                                  std::to_string(runs.size()) + " agent runs");
+        }
+    }
     if (!term_) {
         auto t = vt::Terminal::create(o_.size, topts, this);
         if (!t) return Unexpected(t.error());
@@ -375,7 +501,8 @@ Result<void> Host::setup() {
     } else {
         term_->set_scrollback_limit(o_.scrollback);
         term_->set_scrollback_max_bytes(o_.pane.scrollback_bytes);
-        if (term_->size().cols != o_.size.cols || term_->size().rows != o_.size.rows) term_->resize(o_.size);
+        // The resize to the pane's size waits for the journal: rows it pushes off the screen go
+        // through the store like any output (below).
     }
     vt::ThemeColors theme;
     if (auto c = parse_color(record_.theme_fg)) theme.fg = *c;
@@ -390,7 +517,6 @@ Result<void> Host::setup() {
     record_.cwd_source = std::string(to_string(cwd_.source()));
 
     // History folder and journal.
-    if (auto r = os::make_private_dir(state_dir_); !r) return r;
     if (o_.history) {
         std::string why;
         auto store = os::open_journal_store(os::join(state_dir_, kJournalFile), journal::kRingOffset + o_.ring,
@@ -398,15 +524,36 @@ Result<void> Host::setup() {
         if (!store) return Unexpected(store.error());
         const bool mapped = (*store)->mapped();
         uint32_t flags = mapped ? 0u : journal::kFlagFallback;
-        if (o_.restore_from) flags |= journal::kFlagRestored;
+        if (o_.restore_from || !o_.restore_history.empty()) flags |= journal::kFlagRestored;
         journal_ = std::make_unique<journal::Writer>(std::move(*store), o_.id, o_.ring, flags);
-        journal_->set_size(o_.size.cols, o_.size.rows);
+        journal_->set_size(term_->size().cols, term_->size().rows);
         if (!mapped) log::info("host", "journal: buffered fallback (" + why + ")");
         if (record_.history_id.empty()) record_.history_id = o_.id.str();
-        if (o_.store) {
-            const pty::SpawnSpec probe = shell_spec(o_);
-            start_store(probe.argv.empty() ? std::string() : probe.argv[0]);
-        }
+    }
+    // A restore commits before the series goes on: its first checkpoint (the
+    // restored screen) and its record, then the old folder goes. A restore that dies before
+    // that has added nothing to the store but the old folder's catch-up; after it, the new
+    // folder has all the old one had, and find_successor() leads a later restore to it.
+    if (o_.history && (o_.restore_from || !o_.restore_history.empty())) {
+        if (auto r = write_checkpoint(); !r) log::warn("host", "restored checkpoint: " + r.error().what);
+        write_record_now();
+    }
+    (void)KT_FAULT_POINT("host.restore.checkpointed");
+    if (!old_dir.empty() && old_dir != state_dir_) {
+        old_lock.reset();  // Windows removes no folder with an open file
+        (void)os::remove_tree(old_dir);
+    }
+    if (o_.history && o_.store) {
+        const pty::SpawnSpec probe = shell_spec(o_);
+        start_store(probe.argv.empty() ? std::string() : probe.argv[0]);
+    }
+    if (term_->size().cols != o_.size.cols || term_->size().rows != o_.size.rows) {
+        const uint64_t seq = term_->stream_offset();
+        term_->resize(o_.size);
+        const std::byte payload[4] = {std::byte(o_.size.cols & 0xFF), std::byte(o_.size.cols >> 8),
+                                      std::byte(o_.size.rows & 0xFF), std::byte(o_.size.rows >> 8)};
+        journal_append(journal::Kind::Resize, seq, payload);
+        if (journal_) journal_->set_size(o_.size.cols, o_.size.rows);
     }
     if (!separator.empty()) {
         if (term_->cursor().col != 0) separator = "\r\n" + separator;
@@ -426,11 +573,9 @@ Result<void> Host::setup() {
 #endif
     }
 
-    // our first checkpoint, then the old folder goes.
     if (o_.history) {
         if (auto r = write_checkpoint(); !r) log::warn("host", "first checkpoint: " + r.error().what);
     }
-    if (!old_dir.empty() && old_dir != state_dir_) (void)os::remove_tree(old_dir);
 
     // The endpoint before the child: a client that sees the record can connect.
     auto l = ipc::listen(os::endpoint_name(paths_, o_.id));
@@ -504,10 +649,11 @@ int Host::run() {
     make_keeper();
     if (store_) {
         // One janitor across processes (the lock file); the others stay idle and retry.
-        const config::Config cfg = config::Config::load(load_options(o_.config_file, o_.sets));
-        const store::Policy pol = store::policy_from_config(cfg);
+        // The config is read at every pass: a host lives long, Settings changes the limits.
         store::JanitorThread::Options jo;
-        jo.policy = [pol] { return pol; };
+        const config::LoadOptions lo = load_options(o_.config_file, o_.sets);
+        jo.policy = [lo] { return store::policy_from_config(config::Config::load(lo)); };
+        jo.per_session = [lo, paths = paths_] { return history_policy_for(config::Config::load(lo), paths); };
         jo.on_report = [](const store::JanitorReport& r) {
             if (r.expired || r.closed_sessions || r.over_session_cap || r.over_total_cap || r.recompressed || r.trimmed) {
                 log::info("history", "janitor: expired " + std::to_string(r.expired) + " (raw " +
@@ -556,7 +702,9 @@ void Host::journal_append(journal::Kind k, uint64_t seq, std::span<const std::by
 }
 
 void Host::pty_reader() {
-    std::vector<std::byte> buf(64 * 1024);
+    // One read is one journal record and one feed, so a replay of the journal feeds the
+    // terminal in the same pieces and OSC 133 marks get the same seq.
+    std::vector<std::byte> buf(kJournalChunk);
     for (;;) {
         auto r = pty_->read(buf);
         if (!r) {
@@ -565,6 +713,8 @@ void Host::pty_reader() {
         }
         if (r->bytes) {
             const auto bytes = std::span<const std::byte>(buf.data(), r->bytes);
+            // Outside the terminal lock: the storage thread takes it for the text tap.
+            if (store_) store_->wait_room(bytes.size());
             std::lock_guard lk(mu_);
             const uint64_t seq = term_->stream_offset();
             term_->feed(bytes);
@@ -625,14 +775,43 @@ void Host::finish(bool delete_folder) {
     if (listener_) listener_->close();
     if (int_listener_) int_listener_->close();
     reg_->remove(o_.id);
-    stop_store(os::unix_ms());   // the shell ended: the session's history is complete
+    // A closed pane with the store is archived: the archive catches the store up
+    // from the journal, seals it and keeps the final screen; the series stays open until then.
+    const bool archive = delete_folder && store_ != nullptr;
+    if (archive) {
+        // The store has all the output now: a checkpoint at its end leaves the archive only the
+        // screen to store, however far the journal ring has wrapped since the last one.
+        stop_store(std::nullopt);
+        store_->release();
+        (void)write_checkpoint();
+        write_record_now();
+    } else {
+        stop_store(os::unix_ms());   // the shell ended: the session's history is complete
+    }
     {
         std::lock_guard sl(save_mu_);
         if (journal_) (void)journal_->flush();
-        if (delete_folder) {
+        if (archive) {
+            ArchiveOptions ao;
+            ao.state = paths_.state;
+            ao.term.scrollback_lines = o_.scrollback;
+            ao.term.scrollback_max_bytes = o_.pane.scrollback_bytes;
+            ao.close_reason = pane_closed_ && !delete_on_end_ ? "exited" : "closed";
+            ao.locks_held = true;
+            ao.before_remove = [this] {
+                // Close the journal's file and the lock before removing the folder (Windows keeps
+                // open files). The writer itself stays: the ticker and connection threads may reach it.
+                if (journal_) journal_->close();
+                host_lock_.reset();
+            };
+            auto r = archive_session(state_dir_, ao);
+            // On failure the folder stays: the GUI's sweep archives it later.
+            if (!r) log::error("history", "archive of " + o_.id.str() + ": " + r.error().what);
+        } else if (delete_folder) {
             // Close the journal's file before removing the folder (Windows keeps open files).
             // The writer itself stays: the ticker and connection threads may still reach it.
             if (journal_) journal_->close();
+            host_lock_.reset();
             (void)os::remove_tree(state_dir_);
         } else {
             record_.updated_unix_ms = os::unix_ms();
@@ -907,14 +1086,18 @@ proto::ProcessInfo Host::process_info_locked(const Result<pty::Pid>& fg) {
     return pi;
 }
 
+// The shell's foreground process. Under neither lock: ConPTY answers it (AttachConsole) only while
+// it can write its output, and the output reader needs mu_; and while the console starts on a busy
+// machine it takes seconds, which a kill waiting for pty_mu_ must not (PtyProcess::foreground_pid
+// runs alongside the other calls).
+Result<pty::Pid> Host::foreground() {
+    (void)KT_FAULT_POINT("host.foreground");
+    return pty_->foreground_pid();
+}
+
 proto::ProcessInfo Host::process_info_full() {
     proto::ProcessInfo pi;
-    // Never under mu_: ConPTY answers the foreground query (AttachConsole) only while it can
-    // write its output, and the output reader needs mu_; under a flood that waits forever.
-    Result<pty::Pid> fg = [&] {
-        std::lock_guard pl(pty_mu_);
-        return pty_->foreground_pid();
-    }();
+    Result<pty::Pid> fg = foreground();
     {
         std::lock_guard lk(mu_);
         pi = process_info_locked(fg);
@@ -956,10 +1139,38 @@ void Host::capture_agent() {
     }
     if (next == current) return;
     std::lock_guard lk(mu_);
+    log_agent_run(current, next, os::unix_ms());
     record_.agent = agent_record_to_json(next);
     mark_record_dirty();
     log::info("agents", "session " + o_.id.str() + ": agent record " +
                             (next ? next->agent + " " + next->session_id + " in " + next->directory : std::string("cleared")));
+}
+
+void Host::log_agent_run(const std::optional<agents::AgentResume>& before, const std::optional<agents::AgentResume>& after,
+                         uint64_t now) {
+    const auto same = [](const agents::AgentResume& a, const AgentRun& r) {
+        return a.agent == r.agent && a.session_id == r.conversation;
+    };
+    if (before && (!after || after->agent != before->agent || after->session_id != before->session_id)) {
+        for (auto it = record_.agent_runs.rbegin(); it != record_.agent_runs.rend(); ++it) {
+            if (same(*before, *it) && !it->ended_ms) {
+                it->ended_ms = now;
+                break;
+            }
+        }
+    }
+    if (after && (record_.agent_runs.empty() || !same(*after, record_.agent_runs.back()) || record_.agent_runs.back().ended_ms)) {
+        if (before && after->agent == before->agent && after->session_id == before->session_id) return;
+        AgentRun run;
+        run.agent = after->agent;
+        run.conversation = after->session_id;
+        run.cwd = after->directory;
+        run.args = after->arguments;
+        run.started_ms = now;
+        record_.agent_runs.push_back(std::move(run));
+        // Bounded: a pane that runs agents for months keeps its newest runs.
+        if (record_.agent_runs.size() > 1000) record_.agent_runs.erase(record_.agent_runs.begin());
+    }
 }
 
 void Host::make_keeper() {
@@ -1037,10 +1248,7 @@ void Host::agents_loop() {
             last_chain = Clock::now() - 24h;
         }
         uint32_t fg = 0;
-        {
-            std::lock_guard pl(pty_mu_);
-            if (auto f = pty_->foreground_pid()) fg = *f;
-        }
+        if (auto f = foreground()) fg = *f;
         const auto now = Clock::now();
         if (fg != last_fg) {
             last_fg = fg;
@@ -1293,6 +1501,22 @@ void Host::client_reader(std::shared_ptr<Client> c) {
                     wake_agents();
                     break;
                 }
+                // What the history files the session under: the project by value
+                // (a JSON object; empty: none) and the tab's own name.
+                if (so.key == "history.project" || so.key == "history.tab_title") {
+                    std::lock_guard lk(mu_);
+                    if (so.key == "history.tab_title") {
+                        record_.tab_title = so.value.substr(0, 256);
+                    } else if (so.value.empty()) {
+                        record_.project = json::Value::null();
+                    } else if (auto v = json::parse(so.value); v && v->kind() == json::Value::Kind::Object) {
+                        record_.project = std::move(*v);
+                    } else {
+                        break;
+                    }
+                    mark_record_dirty();
+                    break;
+                }
                 if (so.key == "pane.private") {
                     if (context_) context_->set_private(so.value == "1" || so.value == "true");
                     wake_agents();
@@ -1420,19 +1644,38 @@ void Host::bell() {
 }
 
 void Host::command_started(std::u8string_view line) {
-    if (replaying_ || !store_) return;
-    store_->command_started(std::string(reinterpret_cast<const char*>(line.data()), line.size()), cwd_.cwd(),
-                            term_->stream_offset(), os::unix_ms());
+    // The live writer takes the commands from its own terminal (session/history_writer.h).
+    if (replaying_ && catchup_) catchup_->command_started(line);
 }
 
 void Host::command_finished(std::optional<int> exit_code) {
-    if (replaying_ || !store_) return;
-    store_->command_finished(exit_code, os::unix_ms());
+    if (replaying_ && catchup_) catchup_->command_finished(exit_code);
 }
 
 // ------------------------------------------------------------------------------- store
 
+Result<void> Host::lock_series(const std::string& history_id) {
+    if (series_lock_) return {};
+    const auto dir = platform::paths::from_utf8(os::join(os::join(paths_.state, "history"), history_id));
+    if (auto r = platform::paths::make_private_dir(dir); !r) return r;
+    auto l = wait_lock(dir / kSeriesLockFile, 5s);
+    if (!l) return Unexpected(l.error());
+    series_lock_ = std::move(*l);
+    return {};
+}
+
 void Host::start_store(const std::string& shell) {
+    // The host reports ready only after this: a slow step shows in the log.
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto slow = [&](const char* what) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (ms >= 1000) log::warn("host", std::string("history store: ") + what + " took " + std::to_string(ms) + " ms");
+    };
+    if (auto r = lock_series(record_.history_id); !r) {
+        // Another process writes the series: no store rather than two writers.
+        log::warn("host", "history store: " + r.error().what);
+        return;
+    }
     const config::Config cfg = config::Config::load(load_options(o_.config_file, o_.sets));
     HistoryWriterOptions ho;
     ho.root = platform::paths::from_utf8(os::join(paths_.state, "history"));
@@ -1442,6 +1685,19 @@ void Host::start_store(const std::string& shell) {
     ho.session.started_ms = record_.created_unix_ms;
     ho.fresh = store::fresh_options_from_config(cfg);
     ho.policy = store::policy_from_config(cfg);
+    // The memory bound: the queue (ring/2), the pipe to the store thread (ring/8) and the open raw block
+    // (ring/4) stay below the journal ring, so a crash never loses output the journal no longer has.
+    ho.queue_bytes = std::min<std::size_t>(ho.queue_bytes, o_.ring / 2);
+    ho.pipe_bytes = std::min<std::size_t>(ho.pipe_bytes, o_.ring / 8);
+    ho.fresh.block_raw = std::min<uint32_t>(ho.fresh.block_raw, o_.ring / 4);
+    ho.record_chunk = kJournalChunk;
+    ho.journal_path = os::join(state_dir_, kJournalFile);
+    ho.term.scrollback_lines = o_.scrollback;
+    ho.term.scrollback_max_bytes = o_.pane.scrollback_bytes;
+    ho.cwd = [this] {
+        std::lock_guard lk(mu_);
+        return cwd_.cwd();
+    };
     ho.on_usage = [](const store::UsageEvent& e) {
         // The GUI subscribes to these for its notifications later; until then the log has them.
         if (e.type == store::UsageEvent::Type::threshold) {
@@ -1453,7 +1709,9 @@ void Host::start_store(const std::string& shell) {
                                                                                    : "usage: warm writes resumed");
         }
     };
+    slow("the series lock and the config");
     auto w = HistoryWriter::start(std::move(ho), mu_, *term_);
+    slow("the start");
     if (!w) {
         // The journal and the restore do not depend on the store.
         log::warn("host", "history store: " + w.error().what);
@@ -1477,14 +1735,27 @@ Result<void> Host::write_checkpoint() {
     if (!journal_) return {};
     std::vector<std::byte> snap;
     uint64_t seq = 0;
-    {
-        std::lock_guard lk(mu_);
+    bool same = false;
+    // Under the terminal lock.
+    const auto take = [&] {
         seq = term_->stream_offset();
-        if (seq == last_checkpoint_seq_) return {};
+        if (seq == last_checkpoint_seq_) {
+            same = true;
+            return;
+        }
         snap = term_->snapshot();
         output_since_checkpoint_ = 0;
         last_checkpoint_ = Clock::now();
+    };
+    if (store_) {
+        // The store gets the text and the commands up to the snapshot first; a
+        // checkpoint it could not reach in time is not written (the next one is).
+        if (!store_->checkpoint(take)) return {};
+    } else {
+        std::lock_guard lk(mu_);
+        take();
     }
+    if (same) return {};
     const std::string path = os::join(state_dir_, checkpoint_name(seq));
     const auto t0 = Clock::now();
     if (auto r = os::write_file_atomic(path, std::string_view(reinterpret_cast<const char*>(snap.data()), snap.size()));
@@ -1571,10 +1842,7 @@ void Host::ticker() {
                 integration = cwd_.integration_active() || ended_;
             }
             if (!integration) {
-                {
-                    std::lock_guard pl(pty_mu_);
-                    if (auto f = pty_->foreground_pid()) fg = *f;
-                }
+                if (auto f = foreground()) fg = *f;
                 auto q = fg ? query_process_cwd(fg) : Result<std::string>(make_error(Errc::unavailable, "no pid"));
                 std::lock_guard lk(mu_);
                 if (q && !q->empty()) {
@@ -1644,6 +1912,18 @@ int host_main(int argc, char** argv, int i) {
                 break;
             }
             o.restore_from = *id;
+        } else if (a == "--restore-history") {
+            o.restore_history = next();
+            if (!SessionId::parse(o.restore_history)) {
+                bad = "bad --restore-history id";
+                break;
+            }
+        } else if (a == "--resume-run") {
+            const std::string v = next();
+            char* end = nullptr;
+            const unsigned long n = std::strtoul(v.c_str(), &end, 10);
+            if (v.empty() || !end || *end) bad = "bad --resume-run";
+            else o.resume_run = n;
         } else if (a == "--cwd") {
             o.cwd = next();
         } else if (a == "--size") {

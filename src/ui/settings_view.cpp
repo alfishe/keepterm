@@ -117,8 +117,7 @@ EventResult SettingsView::on_key(const KeyEvent& k) {
             if (on_search) on_search("");
             return EventResult::Handled;
         }
-        // A window of its own stays open on Escape, like other settings windows.
-        if (windowed_) return EventResult::Ignored;
+        // Closes the sheet and the window of its own alike.
         if (on_close) on_close();
         return EventResult::Handled;
     }

@@ -259,6 +259,19 @@ std::vector<PaneDef> build() {
                       }},
                  }});
 
+    p.push_back({"history", "History", ui::Icon::history, Special::History,
+                 {
+                     {"Retention",
+                      {
+                          {"storage.keep_closed", "Delete closed sessions after",
+                           "Pinned sessions are kept.", C::Preset, 0, {}, kAll,
+                           "0s=Never|24h=1 day|72h=3 days|168h=1 week|336h=2 weeks|720h=1 month|1440h=2 months|2160h=3 months|"
+                           "4320h=6 months|8760h=1 year"},
+                          {"storage.cold_after", "Compress after", "Older output is packed tighter.", C::Preset, 0, {}, kAll,
+                           "1h=1 hour|6h=6 hours|24h=1 day|72h=3 days|168h=1 week"},
+                      }},
+                 }});
+
     p.push_back({"storage", "Storage", ui::Icon::storage, Special::Storage,
                  {
                      {"Limits",
@@ -271,10 +284,8 @@ std::vector<PaneDef> build() {
                      {"Retention",
                       {
                           {"storage.max_age", "Delete sessions older than", "", C::Text},
-                          {"storage.keep_closed", "Keep closed sessions for", "", C::Text},
                           {"storage.raw_max_age", "Keep raw output for", "", C::Text},
                           {"storage.events_max_age", "Keep events for", "", C::Text},
-                          {"storage.cold_after", "Recompress after", "", C::Text},
                       }},
                      {"Compression",
                       {

@@ -9,6 +9,7 @@
 // selection (a resize clears it), file path detection.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -16,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include "base/error.h"
 #include "view/terminal/terminal_view.h"
 #include "vt/cell.h"
 
@@ -97,6 +99,32 @@ struct Match {
 // Literal, case-insensitive (ASCII, Latin-1, Greek, Cyrillic) search over logical lines, oldest
 // first. Stops after `limit` matches.
 std::vector<Match> find_all(const LineSource&, std::string_view query_utf8, size_t limit = 10000);
+// The same with a PCRE2 regular expression (case-insensitive, Unicode), within each logical line;
+// empty matches are skipped. The pattern is untrusted (typed, pasted): every resource has a limit,
+// so no pattern crashes, hangs or eats memory.
+//   - compiling: its length, the nesting of parentheses and the compiled size; a pattern over
+//     them, or not valid (including invalid UTF-8 and \C), is an error saying why;
+//   - matching: per line, the backtracking steps, the depth and the heap; a line's length (one
+//     pattern item can scan a whole line between two looks at the clock); and the whole search
+//     a wall-clock budget, checked inside a match too (automatic callouts), so one line that
+//     backtracks forever ends it.
+// A limit hit while matching keeps what was found: `stopped` says why it is not all.
+struct RegexLimits {
+    size_t max_pattern_bytes = 1024;
+    uint32_t max_nesting = 32;
+    size_t max_compiled_bytes = 64 * 1024;
+    uint32_t match_steps = 1'000'000;   // per line
+    uint32_t depth = 10'000;            // backtracking frames, per line
+    uint32_t heap_kib = 8 * 1024;       // per line
+    size_t max_line_bytes = 256 * 1024;  // a longer line is searched in its first ones
+    std::chrono::milliseconds budget{150};
+};
+struct RegexFound {
+    std::vector<Match> matches;
+    std::string stopped;   // "" when the search covered every line
+};
+Result<RegexFound> find_all_regex(const LineSource&, std::string_view pattern_utf8, size_t limit = 10000,
+                                  const RegexLimits& limits = {});
 void match_highlights(const LineSource&, const std::vector<Match>&, std::optional<size_t> current, uint32_t background,
                       uint32_t current_background, std::vector<Highlight>& out);
 

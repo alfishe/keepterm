@@ -29,6 +29,8 @@ int run_cli(int argc, char** argv, int first) {
     if (first >= argc) return usage();
     const std::string_view cmd = argv[first];
     LoadOptions opts;
+    // The running profile (KEEPTERM_PROFILE, as the app and the panes load it) unless --profile names one.
+    if (auto prof = platform::paths::env_utf8("KEEPTERM_PROFILE"); prof && platform::paths::valid_profile_name(*prof)) opts.profile = *prof;
     DumpOptions dopts;
     std::optional<std::string> positional;
     for (int i = first + 1; i < argc; ++i) {

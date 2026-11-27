@@ -45,6 +45,10 @@ struct AltAction {
 struct Item {
     std::string key;                    // stable: "cmd:pane.split_right", "prj:<id>", "tab:<id>", "dir:<path>", "ses:<id>"
     std::string title, subtitle;
+    // A second line under the title (a line of output); its marks (byte offset, length) are
+    // drawn highlighted.
+    std::string detail;
+    std::vector<std::pair<std::size_t, std::size_t>> detail_marks;
     std::string category;               // section header in the empty state
     std::string_view icon;
     std::vector<std::string> aliases;   // English title, path, project name
@@ -79,6 +83,29 @@ struct SessionInfo {
     enum class State : std::uint8_t { Attached, Orphaned, Outdated } state = State::Attached;
     std::uint64_t memory_bytes = 0;
 };
+// A session of the history: the History scope.
+struct HistoryInfo {
+    std::string id, title, project, cwd;
+    enum class State : std::uint8_t { Live, Background, Closed } state = State::Closed;
+    std::vector<std::string> agents, tags;
+    std::int64_t last_used_ms = 0, ended_ms = 0;
+    bool pinned = false;
+    std::vector<std::string> agent_names;   // the agents as people know them ("Claude Code"), same order
+};
+// A line of stored output that matched (store search).
+struct OutputHit {
+    std::string history_id, title, project, text;
+    std::int64_t ts_ms = 0;
+    std::size_t match_offset = 0, match_len = 0;   // the match in text
+    std::uint64_t seq = 0;                         // with text: the line in the output viewer
+};
+// The output search of the History scope. It runs off the UI thread; hits() starts the search of
+// a new query and returns null until it finished (the palette searches again when it did).
+class IHistorySearch {
+public:
+    virtual ~IHistorySearch() = default;
+    virtual const std::vector<OutputHit>* hits(std::string_view query) = 0;
+};
 struct WorkspaceInfo {   // a named workspace (<config>/workspaces/<name>.json)
     std::string name, summary;
     bool is_default = false;
@@ -90,6 +117,9 @@ struct PaletteData {
     std::vector<SessionInfo> sessions;
     std::vector<WorkspaceInfo> workspaces;   // the default first
     std::string current_project_id;
+    // The History scope: the sessions (read when the scope opens) and the output search.
+    std::function<std::vector<HistoryInfo>()> history;
+    IHistorySearch* history_search = nullptr;
 };
 
 class IFileSystem {
@@ -186,6 +216,8 @@ std::unique_ptr<Source> make_folder_source();
 std::unique_ptr<Source> make_session_source();
 std::unique_ptr<Source> make_workspace_source();
 std::unique_ptr<Source> make_path_source();
+std::unique_ptr<Source> make_history_source();          // the History scope's sessions
+std::unique_ptr<Source> make_history_output_source();   // its "In output" section
 // All of the above in source order, filtered by palette.sources (empty = all).
 std::vector<std::unique_ptr<Source>> make_builtin_sources(std::span<const std::string> enabled = {});
 
@@ -255,8 +287,8 @@ private:
     EngineOptions opts_;
     SourceContext ctx_;
     std::vector<PaletteScope> scopes_{PaletteScope::Root};
-    // [scope][mode]: one row per PaletteScope (Workspaces is the last), one per QueryMode (Path).
-    static constexpr std::size_t kScopes = static_cast<std::size_t>(PaletteScope::Workspaces) + 1;
+    // [scope][mode]: one row per PaletteScope (History is the last), one per QueryMode (Path).
+    static constexpr std::size_t kScopes = static_cast<std::size_t>(PaletteScope::History) + 1;
     static constexpr std::size_t kModes = static_cast<std::size_t>(QueryMode::Path) + 1;
     Prepared caches_[kScopes][kModes];
     std::vector<Item> path_items_;

@@ -71,6 +71,12 @@ public:
     Status export_workspace() override { return inner_ ? inner_->export_workspace() : no("export workspace"); }
     Status import_workspace() override { return inner_ ? inner_->import_workspace() : no("import workspace"); }
     Status show_sessions() override { return inner_ ? inner_->show_sessions() : no("sessions overview"); }
+    Status show_session_history() override { return inner_ ? inner_->show_session_history() : no("session history"); }
+    Status reveal_in_history(std::string_view id) override { return inner_ ? inner_->reveal_in_history(id) : no("session history"); }
+    Status open_history_session(std::string_view id) override { return inner_ ? inner_->open_history_session(id) : no("session history"); }
+    Status open_history_output(std::string_view id, std::string_view q, const std::optional<HistoryLine>& line) override {
+        return inner_ ? inner_->open_history_output(id, q, line) : no("session history");
+    }
     Status select_project_relative(int delta) override { return inner_ ? inner_->select_project_relative(delta) : no("select project relative"); }
     Status toggle_sidebar() override { return inner_ ? inner_->toggle_sidebar() : no("toggle sidebar"); }
     Status toggle_resources() override { return inner_ ? inner_->toggle_resources() : no("toggle resources"); }

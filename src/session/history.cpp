@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <set>
+#include <string>
+#include <tuple>
+#include <vector>
 
 #include "session/journal.h"
 #include "session/os.h"
@@ -24,6 +28,36 @@ std::span<const std::byte> as_bytes(const std::string& s) {
 
 }  // namespace
 
+json::Value to_json(const AgentRun& a) {
+    auto v = json::Value::object();
+    v.set("agent", json::Value::string(a.agent));
+    v.set("conversation", json::Value::string(a.conversation));
+    v.set("cwd", json::Value::string(a.cwd));
+    auto args = json::Value::array();
+    for (const auto& x : a.args) args.push(json::Value::string(x));
+    v.set("args", std::move(args));
+    v.set("started_ms", json::Value::integer(static_cast<int64_t>(a.started_ms)));
+    v.set("ended_ms", a.ended_ms ? json::Value::integer(static_cast<int64_t>(*a.ended_ms)) : json::Value::null());
+    return v;
+}
+
+std::optional<AgentRun> agent_run_from_json(const json::Value& v) {
+    if (v.kind() != json::Value::Kind::Object) return std::nullopt;
+    AgentRun a;
+    a.agent = v.str_or("agent");
+    a.conversation = v.str_or("conversation");
+    if (a.agent.empty()) return std::nullopt;
+    a.cwd = v.str_or("cwd");
+    if (const auto* args = v.get("args"); args && args->as_array()) {
+        for (const auto& x : *args->as_array()) {
+            if (const auto* str = x.as_string()) a.args.push_back(*str);
+        }
+    }
+    a.started_ms = v.uint_or("started_ms", 0);
+    if (const auto* e = v.get("ended_ms"); e && e->as_int()) a.ended_ms = static_cast<uint64_t>(*e->as_int());
+    return a;
+}
+
 json::Value to_json(const RecoveryRecord& r) {
     auto v = json::Value::object();
     v.set("schema", json::Value::integer(r.schema));
@@ -33,11 +67,13 @@ json::Value to_json(const RecoveryRecord& r) {
     v.set("cwd", json::Value::string(r.cwd));
     v.set("cwd_source", json::Value::string(r.cwd_source));
     if (r.history) v.set("title", json::Value::string(r.title));
+    if (r.history && !r.tab_title.empty()) v.set("tab_title", json::Value::string(r.tab_title));
     v.set("shell", json::Value::string(r.shell));
     v.set("backend", json::Value::string(r.backend));
     v.set("cols", json::Value::integer(r.cols));
     v.set("rows", json::Value::integer(r.rows));
     v.set("history", json::Value::boolean(r.history));
+    v.set("store", json::Value::boolean(r.store));
     if (r.restored_from) v.set("restored_from", json::Value::string(r.restored_from->str()));
     if (!r.history_id.empty()) v.set("history_id", json::Value::string(r.history_id));
     if (r.exit_code) v.set("exit_code", json::Value::integer(*r.exit_code));
@@ -48,6 +84,17 @@ json::Value to_json(const RecoveryRecord& r) {
     if (!r.theme_bg.empty()) theme.set("bg", json::Value::string(r.theme_bg));
     if (!r.theme_cursor.empty()) theme.set("cursor", json::Value::string(r.theme_cursor));
     v.set("theme", std::move(theme));
+    if (!r.agent_runs.empty()) {
+        auto runs = json::Value::array();
+        for (const auto& a : r.agent_runs) runs.push(to_json(a));
+        v.set("agent_runs", std::move(runs));
+    }
+    if (!r.restores.empty()) {
+        auto rs = json::Value::array();
+        for (uint64_t t : r.restores) rs.push(json::Value::integer(static_cast<int64_t>(t)));
+        v.set("restores", std::move(rs));
+    }
+    if (r.project.kind() == json::Value::Kind::Object) v.set("project", r.project);
     return v;
 }
 
@@ -64,11 +111,13 @@ Result<RecoveryRecord> recovery_record_from_json(const json::Value& v) {
     r.cwd = v.str_or("cwd");
     r.cwd_source = v.str_or("cwd_source");
     r.title = v.str_or("title");
+    r.tab_title = v.str_or("tab_title");
     r.shell = v.str_or("shell");
     r.backend = v.str_or("backend");
     r.cols = static_cast<uint16_t>(std::clamp<uint64_t>(v.uint_or("cols", 80), 1, 4096));
     r.rows = static_cast<uint16_t>(std::clamp<uint64_t>(v.uint_or("rows", 24), 1, 4096));
     r.history = v.bool_or("history", true);
+    r.store = v.bool_or("store", false);
     if (auto rf = SessionId::parse(v.str_or("restored_from"))) r.restored_from = *rf;
     if (auto h = SessionId::parse(v.str_or("history_id"))) r.history_id = h->str();
     if (const auto* e = v.get("exit_code"); e && e->as_int()) r.exit_code = static_cast<int32_t>(*e->as_int());
@@ -79,6 +128,17 @@ Result<RecoveryRecord> recovery_record_from_json(const json::Value& v) {
         r.theme_bg = t->str_or("bg");
         r.theme_cursor = t->str_or("cursor");
     }
+    if (const auto* runs = v.get("agent_runs"); runs && runs->as_array()) {
+        for (const auto& x : *runs->as_array()) {
+            if (auto a = agent_run_from_json(x)) r.agent_runs.push_back(std::move(*a));
+        }
+    }
+    if (const auto* rs = v.get("restores"); rs && rs->as_array()) {
+        for (const auto& x : *rs->as_array()) {
+            if (auto t = x.as_int(); t && *t >= 0) r.restores.push_back(static_cast<uint64_t>(*t));
+        }
+    }
+    if (const auto* pr = v.get("project"); pr && pr->kind() == json::Value::Kind::Object) r.project = *pr;
     return r;
 }
 
@@ -132,7 +192,42 @@ std::string restored_separator(uint64_t unix_ms) {
            " \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n";
 }
 
-Result<Recovered> recover_session(const std::string& dir, const vt::TerminalOptions& topts, vt::TerminalSink* sink) {
+bool has_session_files(const std::string& dir) {
+    for (const auto& name : os::list_dir(dir)) {
+        if (name == kJournalFile || name == kRecordFile || name.rfind("checkpoint-", 0) == 0) return true;
+    }
+    return false;
+}
+
+std::optional<std::string> find_successor(const std::string& sessions_dir, const SessionId& id) {
+    // restored_from -> (created, folder) of every folder with a record.
+    std::vector<std::tuple<std::string, uint64_t, std::string>> links;
+    for (const auto& name : os::list_dir(sessions_dir)) {
+        const std::string dir = os::join(sessions_dir, name);
+        auto r = read_recovery_record(dir);
+        if (!r || !r->restored_from) continue;
+        links.emplace_back(r->restored_from->str(), r->created_unix_ms, name);
+    }
+    std::string cur = id.str();
+    std::set<std::string> seen{cur};
+    for (;;) {
+        const std::string* best = nullptr;
+        uint64_t best_created = 0;
+        for (const auto& [from, created, name] : links) {
+            if (from == cur && (!best || created > best_created)) {
+                best = &name;
+                best_created = created;
+            }
+        }
+        if (!best || !seen.insert(*best).second) return std::nullopt;
+        const std::string dir = os::join(sessions_dir, *best);
+        if (has_session_files(dir)) return dir;
+        cur = *best;
+    }
+}
+
+Result<Recovered> recover_session(const std::string& dir, const vt::TerminalOptions& topts, vt::TerminalSink* sink,
+                                  ReplayObserver* observer) {
     Recovered out;
     if (auto rec = read_recovery_record(dir)) out.record = *rec;
     out.last_unix_ms = out.record ? out.record->updated_unix_ms : 0;
@@ -151,6 +246,7 @@ Result<Recovered> recover_session(const std::string& dir, const vt::TerminalOpti
         }
     }
     const auto& recs = jc.records;
+    if (observer) observer->journal(jc);
     const uint64_t chain_first = recs.empty() ? UINT64_MAX : recs.front().seq;
 
     auto replay = [&](vt::Terminal& t, uint64_t from) {
@@ -159,15 +255,27 @@ Result<Recovered> recover_session(const std::string& dir, const vt::TerminalOpti
                 if (r.stream_end() <= from) continue;
                 auto bytes = r.payload;
                 if (r.seq < from) bytes = bytes.subspan(static_cast<std::size_t>(from - r.seq));
-                t.feed(bytes);
                 ++out.replayed_records;
                 out.replayed_bytes += bytes.size();
+                if (!observer) {
+                    t.feed(bytes);
+                    continue;
+                }
+                observer->record(r.stream_end(), r.ts_unix_ms);
+                const std::size_t piece = std::max<std::size_t>(1, observer->piece());
+                while (!bytes.empty()) {
+                    const std::size_t n = std::min(bytes.size(), piece);
+                    t.feed(bytes.first(n));
+                    bytes = bytes.subspan(n);
+                    observer->fed(t, r.ts_unix_ms);
+                }
             } else if (r.kind == journal::Kind::Resize && r.payload.size() >= 4 && r.seq >= from) {
                 const auto* p = reinterpret_cast<const uint8_t*>(r.payload.data());
                 vt::GridSize g;
                 g.cols = static_cast<uint16_t>(p[0] | (p[1] << 8));
                 g.rows = static_cast<uint16_t>(p[2] | (p[3] << 8));
                 if (g.cols > 0 && g.rows > 0) t.resize(g);
+                if (observer) observer->fed(t, r.ts_unix_ms);
             }
         }
     };
@@ -190,6 +298,7 @@ Result<Recovered> recover_session(const std::string& dir, const vt::TerminalOpti
         }
         out.term = std::move(*t);
         out.checkpoint_seq = seq;
+        if (observer) observer->start(*out.term, seq, true);
         replay(*out.term, seq);
         break;
     }
@@ -207,6 +316,7 @@ Result<Recovered> recover_session(const std::string& dir, const vt::TerminalOpti
         if (!t) return Unexpected(t.error());
         out.term = std::move(*t);
         out.ring_only = !recs.empty();
+        if (observer) observer->start(*out.term, recs.empty() ? 0 : chain_first, false);
         replay(*out.term, 0);
     }
     out.term->reset_program_modes();

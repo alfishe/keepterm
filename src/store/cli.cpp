@@ -37,12 +37,19 @@ int usage() {
                  "       keepterm --history search <query> [--regex] [--case] [--since T] [--until T]\n"
                  "                [--session ID]... [--project P] [--kind K]... [--limit N] [--json] [--explain]\n"
                  "       keepterm --history forget <session>\n"
-                 "       keepterm --history pin <session> | unpin <session>\n"
                  "       keepterm --history backfill <session> [--journal FILE] [--project P] [--no-raw]\n"
                  "       keepterm --history janitor\n"
+                 "       keepterm --history list | show | restore | rename | tag | untag | pin | unpin | delete (sessions)\n"
                  "common: --root DIR (default <state>/history)\n"
                  "T: 90m, 2h, 7d, 2w back from now; YYYY-MM-DD[THH:MM[:SS]] local time; Unix ms\n");
     return 2;
+}
+
+// The config of the running profile (KEEPTERM_PROFILE), as the app and the hosts load it.
+config::LoadOptions profile_options() {
+    config::LoadOptions o;
+    if (auto p = platform::paths::env_utf8("KEEPTERM_PROFILE"); p && platform::paths::valid_profile_name(*p)) o.profile = *p;
+    return o;
 }
 
 fs::path state_dir() {
@@ -102,6 +109,7 @@ std::string local_time(uint64_t ms) {
 
 struct Common {
     fs::path root;
+    std::function<Janitor::PolicyFor(const config::Config&)> per_session;
     bool json = false;
     std::vector<std::string> rest;
 };
@@ -118,6 +126,7 @@ std::string pct(double p) {
 }
 
 std::string json_limit(const LimitUsage& l) {
+    if (l.limit == kOff) return "{\"used\":" + std::to_string(l.used) + ",\"limit\":null,\"remaining\":null,\"percent\":0}";
     char b[160];
     std::snprintf(b, sizeof b, "{\"used\":%llu,\"limit\":%llu,\"remaining\":%llu,\"percent\":%.2f}",
                   static_cast<unsigned long long>(l.used), static_cast<unsigned long long>(l.limit),
@@ -152,8 +161,9 @@ std::string when(uint64_t at, uint64_t now) {
 int cmd_du(Common& c) {
     auto cat = open_catalog(c.root);
     if (!cat) return fail(cat.error().what);
-    const Policy pol = policy_from_config(config::Config::load({}));
-    auto u = usage(**cat, c.root, pol, now_unix_ms());
+    const config::Config cfg = config::Config::load(profile_options());
+    const Policy pol = policy_from_config(cfg);
+    auto u = usage(**cat, c.root, pol, now_unix_ms(), c.per_session ? c.per_session(cfg) : Janitor::PolicyFor{});
     if (!u) return fail(u.error().what);
     if (c.json) {
         std::string o = "{\"root\":" + json_str(platform::paths::to_utf8(c.root)) + ",\"now_ms\":" + std::to_string(u->now_ms);
@@ -161,7 +171,7 @@ int cmd_du(Common& c) {
         o += ",\"min_free_disk\":{\"capacity\":" + std::to_string(u->disk.capacity) + ",\"available\":" +
              std::to_string(u->disk.available) + ",\"threshold\":" + std::to_string(u->disk.threshold) +
              ",\"writes_stopped\":" + (u->disk.below ? "true" : "false") + ",\"fill\":" + json_limit(u->disk.fill) + "}";
-        o += ",\"max_per_session\":" + std::to_string(pol.max_per_session) + "}";
+        o += ",\"max_per_session\":" + (pol.max_per_session == kOff ? std::string("null") : std::to_string(pol.max_per_session)) + "}";
         o += ",\"bytes\":" + json_kinds(u->kind_bytes, u->index_bytes);
         o += ",\"catalog\":" + std::to_string(u->catalog_bytes) + ",\"pinned\":" + std::to_string(u->pinned_bytes);
         o += ",\"payload\":{\"raw\":" + std::to_string(u->raw_payload_bytes) + ",\"text\":" +
@@ -185,6 +195,10 @@ int cmd_du(Common& c) {
     std::printf("store  %s\n\n", platform::paths::to_utf8(c.root).c_str());
     std::printf("%-26s %12s %12s %12s %8s\n", "limit", "used", "limit", "remaining", "percent");
     auto row = [](const std::string& name, const LimitUsage& l) {
+        if (l.limit == kOff) {
+            std::printf("%-26s %12s %12s %12s %8s\n", name.c_str(), human(l.used).c_str(), "off", "-", "-");
+            return;
+        }
         std::printf("%-26s %12s %12s %12s %8s\n", name.c_str(), human(l.used).c_str(), human(l.limit).c_str(),
                     human(l.remaining).c_str(), pct(l.percent).c_str());
     };
@@ -328,14 +342,6 @@ int cmd_forget(Common& c) {
     return 0;
 }
 
-int cmd_pin(Common& c, bool pin) {
-    if (c.rest.size() != 1) return usage();
-    auto cat = open_catalog(c.root);
-    if (!cat) return fail(cat.error().what);
-    if (auto r = (*cat)->set_pinned(c.rest[0], pin); !r) return fail(r.error().what);
-    return 0;
-}
-
 int cmd_backfill(Common& c) {
     std::string id, project;
     fs::path journal;
@@ -398,7 +404,8 @@ int cmd_janitor(Common& c) {
     if (!*lock) return fail("another process runs the janitor", 3);
     auto cat = open_catalog(c.root);
     if (!cat) return fail(cat.error().what);
-    Janitor j(**cat, c.root, policy_from_config(config::Config::load({})));
+    const config::Config cfg = config::Config::load(profile_options());
+    Janitor j(**cat, c.root, policy_from_config(cfg), c.per_session ? c.per_session(cfg) : Janitor::PolicyFor{});
     auto rep = j.run_pass(now_unix_ms());
     if (!rep) return fail(rep.error().what);
     std::printf("orphans %u files, %u rows, %u temp; expired %u; closed sessions %u; caps %u+%u; merged %u->%u; "
@@ -480,10 +487,12 @@ std::optional<uint64_t> parse_time_arg(std::string_view s, uint64_t now_ms) {
     return static_cast<uint64_t>(t) * 1000;
 }
 
-int history_cli(int argc, char** argv, int first) {
+int history_cli(int argc, char** argv, int first, const fs::path& default_root,
+                const std::function<Janitor::PolicyFor(const config::Config&)>& per_session) {
     if (first >= argc) return usage();
     const std::string_view cmd = argv[first];
     Common c;
+    c.per_session = per_session;
     for (int i = first + 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--root" && i + 1 < argc) {
@@ -494,6 +503,7 @@ int history_cli(int argc, char** argv, int first) {
             c.rest.emplace_back(a);
         }
     }
+    if (c.root.empty()) c.root = default_root;
     if (c.root.empty()) {
         const fs::path s = state_dir();
         if (s.empty()) return fail("no state folder");
@@ -502,8 +512,6 @@ int history_cli(int argc, char** argv, int first) {
     if (cmd == "du") return c.rest.empty() ? cmd_du(c) : usage();
     if (cmd == "search") return cmd_search(c);
     if (cmd == "forget") return cmd_forget(c);
-    if (cmd == "pin") return cmd_pin(c, true);
-    if (cmd == "unpin") return cmd_pin(c, false);
     if (cmd == "backfill") return cmd_backfill(c);
     if (cmd == "janitor") return c.rest.empty() ? cmd_janitor(c) : usage();
     return usage();

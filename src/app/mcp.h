@@ -4,8 +4,9 @@
 //
 // Two tools, as unreal-ng's bridge: `search` finds commands in the catalogue by keywords and
 // shows their arguments; `invoke` runs one with its `args`, exactly as the CLI's request would.
-// Everything the CLI can do over the channel an agent can do this way; the CLI stays the
-// fallback when no MCP client is there.
+// Everything the CLI can do an agent can do this way: the wire commands go to the window, the
+// commands the CLI runs without the app (sessions, history, resources, config, ...) run this
+// executable as that CLI. The CLI stays the fallback when no MCP client is there.
 #pragma once
 
 #include <cstddef>
@@ -24,13 +25,19 @@ struct Context {
     std::string default_pane;            // the bridge's KEEPTERM_PANE, for pane commands
     // Runs one control request ({id, command, needs, args}) and returns its response.
     std::function<json::Value(const json::Value& request)> handle;
+    // Runs this executable as a CLI (control::run_self) for the catalogue's local commands.
+    std::function<Result<SelfRun>(const std::vector<std::string>& args, int timeout_ms)> run_local;
 };
+
+// The CLI words of a local command (CommandInfo::local) with `args` (its named arguments):
+// the error names a missing, unknown or mistyped argument.
+Result<std::vector<std::string>> local_argv(const CommandInfo& c, const json::Value& args);
 
 // One JSON-RPC message in, the answer out; empty for a notification (or a response the client
 // sent). Never throws; malformed input gets a JSON-RPC error.
 std::string handle_message(std::string_view line, const Context& ctx);
 
-// The commands of `available` (all when empty) that match `query`, best first. Words of the
+// The commands of `available` (all when empty) plus the local ones that match `query`, best first. Words of the
 // query match the command's name, its CLI form, its help and its argument names; an empty
 // query lists everything in catalogue order.
 std::vector<const CommandInfo*> search(std::string_view query, std::size_t limit, const std::vector<std::string>& available);

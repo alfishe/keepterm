@@ -131,6 +131,14 @@ void add_palettes(CommandRegistry& r) {
         r.add(std::move(c));
     }
     {
+        Command c = make("palette.history", "Search History", "Every session of the history and their stored output",
+                         Category::Palettes, kWin, scope(PaletteScope::History));
+        c.icon = "history";
+        c.opens_scope = PaletteScope::History;
+        c.availability = need_window;
+        r.add(std::move(c));
+    }
+    {
         Command c = make("palette.folders", "Recent Folders", "Folders your shells visited and projects you opened",
                          Category::Palettes, kWin, scope(PaletteScope::Folders));
         c.icon = "folder";
@@ -625,6 +633,9 @@ void add_app(CommandRegistry& r) {
            h([](ICommandTarget& t, CommandContext&) { return t.import_workspace(); }));
     simple("session.overview", "Sessions\xE2\x80\xA6", "Every pane's session per project, and the live sessions no tab shows",
            h([](ICommandTarget& t, CommandContext&) { return t.show_sessions(); }));
+    simple("session.history", "Session History", "Every session, live and closed: find, restore, resume, tag",
+           h([](ICommandTarget& t, CommandContext&) { return t.show_session_history(); }))
+        .icon = "history";
     simple("app.open_config", "Open Config File", "Open config.toml in the default editor",
            h([](ICommandTarget& t, CommandContext&) { return t.open_config_file(); }));
     simple("quick_terminal.toggle", "Toggle Quick Terminal", "Show or hide the quick terminal from anywhere",
